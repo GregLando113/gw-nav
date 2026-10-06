@@ -5,7 +5,7 @@ use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use eframe::egui_wgpu;
 use egui_extras::{Column, TableBuilder};
 use gw_nav::PathingData;
-use gw_nav::api::{MapAnnotations, MapEntry};
+use gw_nav::api::{Instance, MapAnnotations, MapEntry};
 use gw_nav::mapfile::navmesh::{NONE_U16, Trapezoid};
 use gw_nav::pathfind::NavMesh;
 use gw_nav::render::WorldRender;
@@ -295,8 +295,8 @@ pub struct App {
     source: Source,
     status: String,
     progress: Option<f32>,
-    /// The row picked in the Maps list: its mapid and mapfile.
-    selected: Option<(Option<u32>, Option<u32>)>,
+    /// The row picked in the Maps list.
+    selected: Option<RowKey>,
     map: Option<LoadedMap>,
     generation: u64,
     gpu: Option<egui_wgpu::RenderState>,
@@ -311,9 +311,25 @@ pub struct App {
     hovered_prop: Option<usize>,
     /// The row under the pointer in the Zones list, highlighted on the map.
     zone_list_hover: ListHover,
-    /// The Maps row whose context menu edits its association, and the id
-    /// typed there.
-    association: Option<((Option<u32>, Option<u32>), String)>,
+    /// What the open Maps row context menu edits.
+    association: Option<Association>,
+}
+
+/// A Maps row: its mapid, instance and mapfile (the map files from the
+/// manifest that no row names have only a mapfile).
+type RowKey = (Option<u32>, Option<Instance>, Option<u32>);
+
+fn row_key(zone: &MapEntry) -> RowKey {
+    (zone.mapid, zone.instance, zone.mapfile)
+}
+
+/// The state of a Maps row's context menu.
+struct Association {
+    row: RowKey,
+    /// The id typed: a map file id, or for a map file a map id.
+    input: String,
+    /// The instance to set the map file of.
+    instance: Instance,
 }
 
 impl App {
@@ -439,8 +455,12 @@ impl App {
         let file = Some(self.map.as_ref()?.data.mapfile_id);
         let mut maps = self.zones.iter().filter(|z| z.mapfile == file).filter_map(|z| z.mapid);
         match self.selected {
-            Some((Some(id), selected_file)) if selected_file == file => Some(id),
-            _ => maps.next().filter(|_| maps.next().is_none()),
+            Some((Some(id), _, selected_file)) if selected_file == file => Some(id),
+            // A map's outpost and explorable rows may share the file.
+            _ => {
+                let first = maps.next()?;
+                maps.all(|m| m == first).then_some(first)
+            }
         }
     }
 
@@ -502,6 +522,7 @@ impl App {
                 filter.is_empty()
                     || z.name.as_deref().is_some_and(|n| n.to_lowercase().contains(&filter))
                     || z.mapid.is_some_and(|id| id.to_string().contains(&filter))
+                    || z.instance.is_some_and(|i| i.as_str().contains(&filter))
                     || z.mapfile.is_some_and(|f| f.to_string().contains(&filter))
                     || z.zone_paths.iter().any(|p| p.to_lowercase().contains(&filter))
             })
@@ -516,12 +537,19 @@ impl App {
             .striped(true)
             .sense(Sense::click())
             .column(Column::auto().at_least(40.0))
+            .column(Column::auto().at_least(50.0))
             .column(Column::auto().at_least(60.0))
             .column(Column::initial(170.0).at_least(60.0).clip(true).resizable(true))
             .column(Column::remainder().clip(true))
             .header(20.0, |mut header| {
                 header.col(|ui| {
                     ui.strong("mapid");
+                });
+                header.col(|ui| {
+                    ui.strong("instance").on_hover_text(
+                        "Whether the row's map file is loaded for the map's outpost or its explorable (or mission) \
+                         area. A map can have a row for each; most use the same file for both.",
+                    );
                 });
                 header.col(|ui| {
                     let response = ui.strong("mapfile");
@@ -542,9 +570,15 @@ impl App {
             .body(|body| {
                 body.rows(18.0, rows.len(), |mut row| {
                     let zone = rows[row.index()];
-                    row.set_selected(self.selected == Some((zone.mapid, zone.mapfile)));
+                    let key = row_key(zone);
+                    row.set_selected(self.selected == Some(key));
                     row.col(|ui| {
                         ui.label(zone.mapid.map_or("-".into(), |id| id.to_string()));
+                    });
+                    row.col(|ui| {
+                        if let Some(instance) = zone.instance {
+                            ui.weak(instance.as_str());
+                        }
                     });
                     row.col(|ui| {
                         ui.label(zone.mapfile.map_or("-".into(), |f| f.to_string()));
@@ -569,21 +603,24 @@ impl App {
                     });
                     let response = row.response();
                     if response.clicked() {
-                        clicked = Some((zone.mapid, zone.mapfile));
+                        clicked = Some(key);
                     }
                     if editable {
                         // Clicks in the menu's text field must not close it.
                         egui::Popup::context_menu(&response)
                             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                             .show(|ui| {
-                                let key = (zone.mapid, zone.mapfile);
-                                if association.as_ref().is_none_or(|(k, _)| *k != key) {
+                                if association.as_ref().is_none_or(|a| a.row != key) {
                                     // A map's own map file, else the loaded one.
                                     let prefill = zone.mapid.and(zone.mapfile.or(loaded));
-                                    *association = Some((key, prefill.map(|f| f.to_string()).unwrap_or_default()));
+                                    *association = Some(Association {
+                                        row: key,
+                                        input: prefill.map(|f| f.to_string()).unwrap_or_default(),
+                                        instance: zone.instance.unwrap_or(Instance::Outpost),
+                                    });
                                 }
-                                let input = &mut association.as_mut().unwrap().1;
-                                if let Some(change) = association_menu(ui, zone, input, loaded, all) {
+                                let state = association.as_mut().unwrap();
+                                if let Some(change) = association_menu(ui, zone, state, loaded, all) {
                                     associate = Some((key, change));
                                     ui.close();
                                 }
@@ -591,22 +628,24 @@ impl App {
                     }
                 });
             });
-        if let Some(((mapid, old_mapfile), (new_mapid, new_mapfile))) = associate {
+        if let Some((row, (mapid, instance, mapfile))) = associate {
             self.association = None;
-            self.status = match self.source.set_mapfile(new_mapid, new_mapfile) {
+            self.status = match self.source.set_mapfile(mapid, instance, mapfile) {
                 Ok(()) => {
-                    let file = new_mapfile.map_or("no map file".into(), |f| format!("map file {f}"));
-                    format!("Map {new_mapid} now has {file}")
+                    let file = mapfile.map_or("no map file".into(), |f| format!("map file {f}"));
+                    format!("Map {mapid} {instance} now has {file}")
                 }
-                Err(e) => format!("Setting the map file of map {new_mapid} failed: {e}"),
+                Err(e) => format!("Setting the {instance} map file of map {mapid} failed: {e}"),
             };
-            if self.selected == Some((mapid, old_mapfile)) {
-                self.selected = Some((Some(new_mapid), new_mapfile));
+            // The selection follows the row edited (not the map's other
+            // instance).
+            if self.selected == Some(row) && row.1.is_none_or(|i| i == instance) {
+                self.selected = Some((Some(mapid), Some(instance), mapfile));
             }
             self.source.request_maps();
         }
-        if let Some((mapid, mapfile)) = clicked {
-            self.selected = Some((mapid, mapfile));
+        if let Some(key @ (mapid, _, mapfile)) = clicked {
+            self.selected = Some(key);
             match mapfile {
                 Some(id) if self.source.busy.is_none() => {
                     self.manual_id = id.to_string();
@@ -900,19 +939,30 @@ impl eframe::App for App {
     }
 }
 
-/// The context menu of a Maps row: set a map's map file, or the map id of
-/// a map file no map names yet. `input` is the id typed, `loaded` the map
-/// file in the view. Returns the change, as `(mapid, mapfile)`.
+/// The context menu of a Maps row: set the outpost or explorable map file
+/// of a map, or the map id of a map file no map names yet. `loaded` is the
+/// map file in the view. Returns the change, as `(mapid, instance,
+/// mapfile)`.
 fn association_menu(
     ui: &mut egui::Ui,
     zone: &MapEntry,
-    input: &mut String,
+    state: &mut Association,
     loaded: Option<u32>,
     zones: &[MapEntry],
-) -> Option<(u32, Option<u32>)> {
-    let typed = input.trim().parse::<u32>().ok();
+) -> Option<(u32, Instance, Option<u32>)> {
+    let typed = state.input.trim().parse::<u32>().ok();
+    let row_of = |mapid: u32, instance: Instance| {
+        zones.iter().find(|z| z.mapid == Some(mapid) && z.instance == Some(instance))
+    };
     let mut change = None;
-    let mut field = |ui: &mut egui::Ui, label: &str, apply: &str, ok: bool| {
+    let instance_picker = |ui: &mut egui::Ui, instance: &mut Instance| {
+        ui.horizontal(|ui| {
+            for i in Instance::ALL {
+                ui.radio_value(instance, i, i.as_str());
+            }
+        });
+    };
+    let field = |ui: &mut egui::Ui, input: &mut String, label: &str, apply: &str, ok: bool| {
         ui.horizontal(|ui| {
             ui.label(label);
             let edit = ui.add(egui::TextEdit::singleline(input).desired_width(80.0));
@@ -922,11 +972,17 @@ fn association_menu(
         .inner
     };
     match (zone.mapid, zone.mapfile) {
-        (Some(mapid), current) => {
+        (Some(mapid), _) => {
             ui.strong(format!("Map {mapid} {}", zone.name.as_deref().unwrap_or("")));
+            instance_picker(ui, &mut state.instance);
+            let instance = state.instance;
+            let current = row_of(mapid, instance).and_then(|z| z.mapfile);
             let ok = typed.is_some_and(|f| Some(f) != current);
-            if field(ui, "Map file id", "Set", ok) {
-                change = Some((mapid, typed));
+            if field(ui, &mut state.input, "Map file id", "Set", ok) {
+                change = Some((mapid, instance, typed));
+            }
+            if row_of(mapid, instance).is_none() {
+                ui.weak(format!("No {instance} row yet; one is added"));
             }
             if let Some(file) = typed {
                 let others: Vec<String> = zones
@@ -941,27 +997,36 @@ fn association_menu(
             if let Some(file) = loaded.filter(|&f| Some(f) != current)
                 && ui.button(format!("Use the loaded map file ({file})")).clicked()
             {
-                change = Some((mapid, Some(file)));
+                change = Some((mapid, instance, Some(file)));
             }
-            if current.is_some() && ui.button("Clear the map file").clicked() {
-                change = Some((mapid, None));
+            if current.is_some() && ui.button(format!("Clear the {instance} map file")).clicked() {
+                change = Some((mapid, instance, None));
             }
         }
         (None, Some(file)) => {
             ui.strong(format!("Map file {file}"));
-            if field(ui, "Map id", "Assign", typed.is_some()) {
-                change = Some((typed.unwrap(), Some(file)));
+            instance_picker(ui, &mut state.instance);
+            let instance = state.instance;
+            if field(ui, &mut state.input, "Map id", "Assign", typed.is_some()) {
+                change = Some((typed.unwrap(), instance, Some(file)));
             }
             if let Some(mapid) = typed {
-                match zones.iter().find(|z| z.mapid == Some(mapid)) {
-                    Some(z) => {
-                        ui.label(z.name.as_deref().unwrap_or("(no name)"));
-                        if let Some(old) = z.mapfile {
-                            ui.colored_label(Color32::YELLOW, format!("Replaces its map file {old}"));
-                        }
-                    }
-                    None => {
+                let name = zones.iter().find(|z| z.mapid == Some(mapid)).map(|z| z.name.as_deref().unwrap_or("(no name)"));
+                match (name, row_of(mapid, instance)) {
+                    (None, _) => {
                         ui.weak("No such map id yet; a row is added");
+                    }
+                    (Some(name), row) => {
+                        ui.label(name);
+                        match row.and_then(|z| z.mapfile) {
+                            Some(old) => {
+                                ui.colored_label(Color32::YELLOW, format!("Replaces its {instance} map file {old}"));
+                            }
+                            None if row.is_none() => {
+                                ui.weak(format!("No {instance} row yet; one is added"));
+                            }
+                            None => {}
+                        }
                     }
                 }
             }

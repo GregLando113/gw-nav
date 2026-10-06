@@ -81,7 +81,7 @@ The `gw-nav-cli` binary covers the MapDb and the data pipeline, and builds witho
 
 | Command | What it does |
 |---|---|
-| `list`, `search <query>`, `get <mapid>`, `set …` | Read and edit the MapDb (`map_zones`: mapid, name, mapfile) |
+| `list`, `search <query>`, `get <mapid>`, `set <mapid> --instance outpost\|explorable …` | Read and edit the MapDb (`map_zones`: mapid, instance, name, mapfile) |
 | `import <other.db>` | Merge map rows from another MapDb |
 | `download <ids…> --out-dir <dir>` | Download files from the fileserver, decompressed |
 | `manifest` | Print the file ids the fileserver announces |
@@ -98,7 +98,7 @@ The `gw-nav-cli` binary covers the MapDb and the data pipeline, and builds witho
 ## Data and caching
 
 - **MapDb.** `mapfiles.db` drives the map list. It has two tables:
-  - `map_zones`: map ids, names and map file ids, the same schema as GWBS `maploadlog.lua`. Imports merge only this table.
+  - `map_zones`: map ids, names and map file ids, the same schema as GWBS `maploadlog.lua`. A map id has a row per instance (`outpost` or `explorable`): most load the same map file for both, but some don't. Imports merge only this table. A table from before the instance column (an older `maploadlog.lua` log) can't say which instance its files are for, so importing it adds nothing and lists the files no row has yet. In the desktop app, right-click a row in the Maps list to set its map file, or the map id and instance of an unidentified one.
   - `manifest_mapfiles`: map files found in the fileserver's asset manifest. Whenever the CLI, desktop app or relay loads a new manifest, they record its map files here. The ones no `map_zones` row names appear at the end of the map list without a map id; a map's id is only learned when GWBS logs it being loaded.
 - **Cache** (`cache/`, shared by the CLI, the desktop app and the relay):
   - `manifest-<id>.bin`: the asset manifest.

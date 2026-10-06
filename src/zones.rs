@@ -122,6 +122,8 @@ pub fn annotations(
     match MapDb::open(db).and_then(|db| db.all()) {
         Ok(zones) => {
             out.map_ids = zones.iter().filter(|z| z.mapfile == Some(mapfile_id)).map(|z| z.mapid).collect();
+            // A map's outpost and explorable often share the file.
+            out.map_ids.dedup();
         }
         Err(e) => out.notes.push(format!("MapDb {}: {e}", db.display())),
     }
@@ -146,12 +148,14 @@ pub fn map_list(db: &Path) -> Result<Vec<MapEntry>, MapDbError> {
     let zone_paths = |mapfile: Option<u32>| mapfile.and_then(|f| paths.get(&f)).cloned().unwrap_or_default();
     let rows = db.all()?.into_iter().map(|z| MapEntry {
         mapid: Some(z.mapid),
+        instance: Some(z.instance),
         name: z.name,
         zone_paths: zone_paths(z.mapfile),
         mapfile: z.mapfile,
     });
     let unlisted = db.unlisted_mapfiles()?.into_iter().map(|f| MapEntry {
         mapid: None,
+        instance: None,
         name: None,
         mapfile: Some(f.mapfile),
         zone_paths: zone_paths(Some(f.mapfile)),
@@ -197,7 +201,14 @@ mod tests {
         let db = dir.path().join("maps.db");
         assert!(record_zone_paths(&db, 290943, 381071, &chunk).unwrap());
         assert!(!record_zone_paths(&db, 290943, 381071, &chunk).unwrap());
-        MapDb::open(&db).unwrap().upsert(&crate::MapZone { mapid: 546, name: None, mapfile: Some(290943), unknown: None }).unwrap();
+        let zone = crate::MapZone {
+            mapid: 546,
+            instance: crate::Instance::Explorable,
+            name: None,
+            mapfile: Some(290943),
+            unknown: None,
+        };
+        MapDb::open(&db).unwrap().upsert(&zone).unwrap();
         let list = map_list(&db).unwrap();
         assert_eq!(list[0].zone_paths.len(), 6);
         assert!(list[0].zone_paths.iter().all(|p| p.starts_with(r"Chapter4\Missions\Mountain\Ridge\Zones\")));

@@ -6,7 +6,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui;
 use gw_nav::PathingData;
-use gw_nav::api::{self, MapAnnotations, MapEntry};
+use gw_nav::api::{self, Instance, MapAnnotations, MapEntry};
 use gw_nav::render::WorldRender;
 
 pub enum Event {
@@ -107,11 +107,12 @@ impl Source {
                 let summary = report
                     .map(|r| {
                         format!(
-                            "inserted {}, updated {}, unchanged {}, skipped {} (no mapfile)",
+                            "inserted {}, updated {}, unchanged {}, skipped {} (no mapfile), unplaced {} (no instance)",
                             r.inserted.len(),
                             r.updated.len(),
                             r.unchanged,
-                            r.skipped.len()
+                            r.skipped.len(),
+                            r.unplaced.len()
                         )
                     })
                     .map_err(|e| e.to_string());
@@ -121,14 +122,15 @@ impl Source {
         }
     }
 
-    /// Associate map file `mapfile` with map `mapid` in MapDb (`None`
-    /// clears it). The map list needs requesting again afterwards.
+    /// Associate map file `mapfile` with the `instance` of map `mapid` in
+    /// MapDb (`None` clears it). The map list needs requesting again
+    /// afterwards.
     #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
-    pub fn set_mapfile(&self, mapid: u32, mapfile: Option<u32>) -> Result<(), String> {
+    pub fn set_mapfile(&self, mapid: u32, instance: Instance, mapfile: Option<u32>) -> Result<(), String> {
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             Backend::Local { db, .. } => {
-                gw_nav::MapDb::open(db).and_then(|db| db.set_mapfile(mapid, mapfile)).map_err(|e| e.to_string())
+                gw_nav::MapDb::open(db).and_then(|db| db.set_mapfile(mapid, instance, mapfile)).map_err(|e| e.to_string())
             }
             Backend::Relay { .. } => Err("the relay's map list is read-only".into()),
         }

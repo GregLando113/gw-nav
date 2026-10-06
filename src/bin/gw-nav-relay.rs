@@ -228,6 +228,7 @@ mod tests {
         let db = dir.path().join("maps.db");
         MapDb::open(&db)?.upsert(&gw_nav::MapZone {
             mapid: 546,
+            instance: gw_nav::Instance::Explorable,
             name: Some("Jaga Moraine".into()),
             mapfile: Some(290943),
             unknown: None,
@@ -243,6 +244,7 @@ mod tests {
         let entries: Vec<MapEntry> = serde_json::from_str(&body)?;
         assert_eq!(entries, vec![MapEntry {
                 mapid: Some(546),
+                instance: Some(gw_nav::Instance::Explorable),
                 name: Some("Jaga Moraine".into()),
                 mapfile: Some(290943),
                 zone_paths: vec![],

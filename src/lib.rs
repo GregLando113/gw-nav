@@ -15,7 +15,7 @@ pub mod zones;
 #[cfg(not(target_arch = "wasm32"))]
 pub use fileconn::{AssetManifest, FileClient, FileConnError, RawFile};
 #[cfg(not(target_arch = "wasm32"))]
-pub use mapdb::{ImportReport, MapDb, MapDbError, MapZone};
+pub use mapdb::{ImportReport, Instance, MapDb, MapDbError, MapZone, UnplacedZone};
 pub use pathing::PathingData;
 #[cfg(not(target_arch = "wasm32"))]
 pub use pathing::{PathingError, PathingStore};

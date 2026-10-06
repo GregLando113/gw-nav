@@ -32,11 +32,52 @@ pub const FILE_ID_HEADER: &str = "X-Gw-File-Id";
 /// Default address of a locally running relay.
 pub const DEFAULT_RELAY: &str = "http://127.0.0.1:8080";
 
+/// Which instance of a map a map file is loaded for: a map id can use one
+/// map file as an outpost and another as an explorable (or mission) area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Instance {
+    Outpost,
+    Explorable,
+}
+
+impl Instance {
+    pub const ALL: [Instance; 2] = [Instance::Outpost, Instance::Explorable];
+
+    /// The name stored in MapDb and used on the command line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Instance::Outpost => "outpost",
+            Instance::Explorable => "explorable",
+        }
+    }
+}
+
+impl std::fmt::Display for Instance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Instance {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        Instance::ALL
+            .into_iter()
+            .find(|i| i.as_str().eq_ignore_ascii_case(s.trim()))
+            .ok_or_else(|| format!("unknown instance {s:?} (expected outpost or explorable)"))
+    }
+}
+
 /// A map in the map list: a MapDb row, or a map file found in the asset
-/// manifest that no row names (no mapid or name).
+/// manifest that no row names (no mapid, instance or name).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MapEntry {
     pub mapid: Option<u32>,
+    /// The instance the row's map file is for.
+    #[serde(default)]
+    pub instance: Option<Instance>,
     pub name: Option<String>,
     pub mapfile: Option<u32>,
     /// The distinct zone def `.ini` paths recorded for the map file (empty
@@ -200,11 +241,12 @@ mod tests {
         for e in [
             MapEntry {
                 mapid: Some(546),
+                instance: Some(Instance::Explorable),
                 name: Some("Jaga Moraine".into()),
                 mapfile: Some(290943),
                 zone_paths: vec!["Chapter4\\Missions\\Mountain\\Ridge\\Zones\\MountainRidgeSnow.ini".into()],
             },
-            MapEntry { mapid: None, name: None, mapfile: Some(13989), zone_paths: vec![] },
+            MapEntry { mapid: None, instance: None, name: None, mapfile: Some(13989), zone_paths: vec![] },
         ] {
             let json = serde_json::to_string(&e).unwrap();
             assert_eq!(serde_json::from_str::<MapEntry>(&json).unwrap(), e);
@@ -212,5 +254,9 @@ mod tests {
         // Lists from relays without zone paths.
         let old: MapEntry = serde_json::from_str(r#"{"mapid":1,"name":null,"mapfile":2}"#).unwrap();
         assert!(old.zone_paths.is_empty());
+        assert_eq!(old.instance, None);
+        assert_eq!(serde_json::to_string(&Instance::Explorable).unwrap(), r#""explorable""#);
+        assert_eq!("Outpost".parse::<Instance>(), Ok(Instance::Outpost));
+        assert!("town".parse::<Instance>().is_err());
     }
 }

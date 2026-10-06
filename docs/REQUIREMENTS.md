@@ -26,10 +26,12 @@ Use this as the schema for MapDb, same as GWBS maploadlog.lua. SQL table of mapf
 
 ```sql
 CREATE TABLE IF NOT EXISTS map_zones (
-    mapid INTEGER PRIMARY KEY,
+    mapid INTEGER NOT NULL,
+    instance TEXT NOT NULL CHECK (instance IN ('outpost', 'explorable')),
     name TEXT,
     mapfile INTEGER,
-    unknown INTEGER
+    unknown INTEGER,
+    PRIMARY KEY (mapid, instance)
 );
 ```
 

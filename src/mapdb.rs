@@ -1,7 +1,11 @@
 //! MapDb: sqlite table of map zones and their associated mapfile ids.
 //!
-//! The schema matches the `map_zones` table written by GWBS `maploadlog.lua`,
-//! so rows found by other tools can be merged in with [`MapDb::import_from`].
+//! `map_zones` has a row per map id and [`Instance`]: a map id can load one
+//! map file as an outpost and another as an explorable area (most use the
+//! same file for both). The schema matches the table written by GWBS
+//! `maploadlog.lua`, so rows found by other tools can be merged in with
+//! [`MapDb::import_from`]. Databases from before the instance column are
+//! rebuilt on open, their rows kept as outposts.
 //!
 //! A second table, `manifest_mapfiles`, holds the map files found in the
 //! fileserver's asset manifest ([`MapDb::record_manifest`]). The manifest
@@ -14,16 +18,20 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 
+pub use crate::api::Instance;
 use crate::fileconn::MapFileCandidate;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS map_zones (
-    mapid INTEGER PRIMARY KEY,
+    mapid INTEGER NOT NULL,
+    instance TEXT NOT NULL CHECK (instance IN ('outpost', 'explorable')),
     name TEXT,
     mapfile INTEGER,
-    unknown INTEGER
+    unknown INTEGER,
+    PRIMARY KEY (mapid, instance)
 );
 CREATE TABLE IF NOT EXISTS manifest_mapfiles (
     mapfile INTEGER PRIMARY KEY,
@@ -40,12 +48,32 @@ CREATE TABLE IF NOT EXISTS mapfile_zone_defs (
     PRIMARY KEY (mapfile, def_id)
 );";
 
-const SELECT_COLUMNS: &str = "SELECT mapid, name, mapfile, unknown FROM map_zones";
+/// Rebuilds a `map_zones` table from before the instance column; its rows
+/// become outposts.
+const ADD_INSTANCE: &str = "
+ALTER TABLE map_zones RENAME TO map_zones_without_instance;
+CREATE TABLE map_zones (
+    mapid INTEGER NOT NULL,
+    instance TEXT NOT NULL CHECK (instance IN ('outpost', 'explorable')),
+    name TEXT,
+    mapfile INTEGER,
+    unknown INTEGER,
+    PRIMARY KEY (mapid, instance)
+);
+INSERT INTO map_zones (mapid, instance, name, mapfile, unknown)
+    SELECT mapid, 'outpost', name, mapfile, unknown FROM map_zones_without_instance;
+DROP TABLE map_zones_without_instance;";
+
+const SELECT_COLUMNS: &str = "SELECT mapid, instance, name, mapfile, unknown FROM map_zones";
+/// Outposts before explorables.
+const ORDER: &str = "ORDER BY mapid, instance DESC";
 
 /// One row of the `map_zones` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapZone {
     pub mapid: u32,
+    /// The instance `mapfile` is loaded for.
+    pub instance: Instance,
     pub name: Option<String>,
     /// File id of the map blob on the GW fileserver.
     pub mapfile: Option<u32>,
@@ -86,6 +114,18 @@ pub struct ImportReport {
     /// Incoming rows that differed from the local row but were not applied
     /// because their mapfile was empty or 0.
     pub skipped: Vec<MapZone>,
+    /// Rows from a table without the instance column whose map file no
+    /// local row of their map id has. Not applied: it isn't known which
+    /// instance the file is for.
+    pub unplaced: Vec<UnplacedZone>,
+}
+
+/// A `map_zones` row from before the instance column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnplacedZone {
+    pub mapid: u32,
+    pub name: Option<String>,
+    pub mapfile: Option<u32>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -112,18 +152,24 @@ impl MapDb {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(mut conn: Connection) -> Result<Self> {
+        if has_table(&conn, "map_zones")? && !has_column(&conn, "map_zones", "instance")? {
+            let tx = conn.transaction()?;
+            tx.execute_batch(ADD_INSTANCE)?;
+            tx.commit()?;
+        }
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
 
-    /// All rows ordered by mapid.
+    /// All rows ordered by mapid, outposts first.
     pub fn all(&self) -> Result<Vec<MapZone>> {
-        query_zones(&self.conn, &format!("{SELECT_COLUMNS} ORDER BY mapid"), [])
+        query_zones(&self.conn, &format!("{SELECT_COLUMNS} {ORDER}"), [])
     }
 
-    pub fn get(&self, mapid: u32) -> Result<Option<MapZone>> {
-        get_zone(&self.conn, mapid)
+    /// The rows of map `mapid`, outpost first.
+    pub fn get(&self, mapid: u32) -> Result<Vec<MapZone>> {
+        query_zones(&self.conn, &format!("{SELECT_COLUMNS} WHERE mapid = ?1 {ORDER}"), [mapid])
     }
 
     /// Case-insensitive substring match on name. If `query` is a number it
@@ -137,54 +183,59 @@ impl MapDb {
             &format!(
                 "{SELECT_COLUMNS}
                  WHERE name LIKE ?1 ESCAPE '\\' OR mapid = ?2 OR mapfile = ?2
-                 ORDER BY mapid"
+                 {ORDER}"
             ),
             params![pattern, number],
         )
     }
 
-    /// Insert the row, replacing any existing row with the same mapid.
+    /// Insert the row, replacing any existing row with the same mapid and
+    /// instance.
     pub fn upsert(&self, zone: &MapZone) -> Result<()> {
         upsert_zone(&self.conn, zone)
     }
 
-    /// Set the mapfile of map `mapid` (`None` clears it), keeping the rest
-    /// of its row. A mapid without a row gets one with no name.
-    pub fn set_mapfile(&self, mapid: u32, mapfile: Option<u32>) -> Result<()> {
+    /// Set the mapfile of the `instance` of map `mapid` (`None` clears it),
+    /// keeping the rest of its row. A new row takes its name from the map's
+    /// other instance, if it has one.
+    pub fn set_mapfile(&self, mapid: u32, instance: Instance, mapfile: Option<u32>) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO map_zones (mapid, mapfile) VALUES (?1, ?2)
-             ON CONFLICT(mapid) DO UPDATE SET mapfile = excluded.mapfile",
-            params![mapid, mapfile],
+            "INSERT INTO map_zones (mapid, instance, name, mapfile)
+                 VALUES (?1, ?2, (SELECT name FROM map_zones WHERE mapid = ?1 LIMIT 1), ?3)
+             ON CONFLICT(mapid, instance) DO UPDATE SET mapfile = excluded.mapfile",
+            params![mapid, instance, mapfile],
         )?;
         Ok(())
     }
 
     /// Merge all rows from the `map_zones` table of another database.
-    /// New mapids are always inserted. Incoming rows overwrite existing local
-    /// rows only if they carry a mapfile (non-empty, non-zero). The merge runs
-    /// in a single transaction, so on error the local database is unchanged.
+    /// New rows are always inserted. Incoming rows overwrite existing local
+    /// rows only if they carry a mapfile (non-empty, non-zero). A table
+    /// without the instance column (GWBS `maploadlog.lua` before it logged
+    /// instances) adds nothing: its rows are unchanged if their map id has
+    /// a row with that mapfile, and [`ImportReport::unplaced`] otherwise.
+    /// The merge runs in a single transaction, so on error the local
+    /// database is unchanged.
     pub fn import_from(&mut self, path: impl AsRef<Path>) -> Result<ImportReport> {
         let path = path.as_ref();
         let src = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        let has_table: bool = src.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'map_zones')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_table {
+        if !has_table(&src, "map_zones")? {
             return Err(MapDbError::MissingTable {
                 path: path.to_path_buf(),
             });
         }
-        let incoming = query_zones(&src, &format!("{SELECT_COLUMNS} ORDER BY mapid"), [])?;
+        if !has_column(&src, "map_zones", "instance")? {
+            return self.import_without_instance(&src);
+        }
+        let incoming = query_zones(&src, &format!("{SELECT_COLUMNS} {ORDER}"), [])?;
 
         let tx = self.conn.transaction()?;
         let mut report = ImportReport::default();
         for zone in incoming {
-            match get_zone(&tx, zone.mapid)? {
+            match get_zone(&tx, zone.mapid, zone.instance)? {
                 None => {
                     upsert_zone(&tx, &zone)?;
                     report.inserted.push(zone);
@@ -198,6 +249,27 @@ impl MapDb {
             }
         }
         tx.commit()?;
+        Ok(report)
+    }
+
+    fn import_without_instance(&self, src: &Connection) -> Result<ImportReport> {
+        let mut stmt = src.prepare("SELECT mapid, name, mapfile FROM map_zones ORDER BY mapid")?;
+        let incoming = stmt
+            .query_map([], |row| Ok(UnplacedZone { mapid: row.get(0)?, name: row.get(1)?, mapfile: row.get(2)? }))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut report = ImportReport::default();
+        for zone in incoming {
+            let known: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM map_zones WHERE mapid = ?1 AND mapfile IS ?2)",
+                params![zone.mapid, zone.mapfile],
+                |row| row.get(0),
+            )?;
+            if known {
+                report.unchanged += 1;
+            } else {
+                report.unplaced.push(zone);
+            }
+        }
         Ok(report)
     }
 
@@ -314,12 +386,41 @@ fn query_manifest_mapfiles(conn: &Connection, filter: &str) -> Result<Vec<Manife
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+impl ToSql for Instance {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for Instance {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        value.as_str()?.parse().map_err(|e: String| FromSqlError::Other(e.into()))
+    }
+}
+
+fn has_table(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )?)
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+        [table, column],
+        |row| row.get(0),
+    )?)
+}
+
 fn row_to_zone(row: &Row) -> rusqlite::Result<MapZone> {
     Ok(MapZone {
         mapid: row.get(0)?,
-        name: row.get(1)?,
-        mapfile: row.get(2)?,
-        unknown: row.get(3)?,
+        instance: row.get(1)?,
+        name: row.get(2)?,
+        mapfile: row.get(3)?,
+        unknown: row.get(4)?,
     })
 }
 
@@ -329,11 +430,11 @@ fn query_zones(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> R
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-fn get_zone(conn: &Connection, mapid: u32) -> Result<Option<MapZone>> {
+fn get_zone(conn: &Connection, mapid: u32, instance: Instance) -> Result<Option<MapZone>> {
     Ok(conn
         .query_row(
-            &format!("{SELECT_COLUMNS} WHERE mapid = ?1"),
-            [mapid],
+            &format!("{SELECT_COLUMNS} WHERE mapid = ?1 AND instance = ?2"),
+            params![mapid, instance],
             row_to_zone,
         )
         .optional()?)
@@ -341,10 +442,10 @@ fn get_zone(conn: &Connection, mapid: u32) -> Result<Option<MapZone>> {
 
 fn upsert_zone(conn: &Connection, zone: &MapZone) -> Result<()> {
     conn.execute(
-        "INSERT INTO map_zones (mapid, name, mapfile, unknown) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(mapid) DO UPDATE SET
+        "INSERT INTO map_zones (mapid, instance, name, mapfile, unknown) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(mapid, instance) DO UPDATE SET
              name = excluded.name, mapfile = excluded.mapfile, unknown = excluded.unknown",
-        params![zone.mapid, zone.name, zone.mapfile, zone.unknown],
+        params![zone.mapid, zone.instance, zone.name, zone.mapfile, zone.unknown],
     )?;
     Ok(())
 }
@@ -368,10 +469,15 @@ mod tests {
     fn zone(mapid: u32, name: &str, mapfile: u32) -> MapZone {
         MapZone {
             mapid,
+            instance: Instance::Outpost,
             name: Some(name.to_string()),
             mapfile: Some(mapfile),
             unknown: Some(0),
         }
+    }
+
+    fn explorable(mapid: u32, name: &str, mapfile: u32) -> MapZone {
+        MapZone { instance: Instance::Explorable, ..zone(mapid, name, mapfile) }
     }
 
     fn sample_db() -> MapDb {
@@ -395,34 +501,64 @@ mod tests {
     }
 
     #[test]
+    fn adds_instance_column_to_old_table() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("old.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE map_zones (mapid INTEGER PRIMARY KEY, name TEXT, mapfile INTEGER, unknown INTEGER);
+                 INSERT INTO map_zones VALUES (109, 'The Amnoon Oasis', 290943, 0);",
+            )
+            .unwrap();
+        let db = MapDb::open(&path).unwrap();
+        assert_eq!(db.all().unwrap(), vec![zone(109, "The Amnoon Oasis", 290943)]);
+        db.upsert(&explorable(109, "The Amnoon Oasis", 1)).unwrap();
+        assert_eq!(db.get(109).unwrap().len(), 2);
+    }
+
+    #[test]
     fn upsert_get_all_round_trip() {
         let db = sample_db();
         let nulls = MapZone {
             mapid: 5,
+            instance: Instance::Explorable,
             name: None,
             mapfile: None,
             unknown: None,
         };
         db.upsert(&nulls).unwrap();
-        assert_eq!(db.get(5).unwrap(), Some(nulls.clone()));
-        assert_eq!(db.get(999).unwrap(), None);
+        assert_eq!(db.get(5).unwrap(), vec![nulls.clone()]);
+        assert_eq!(db.get(999).unwrap(), vec![]);
 
         db.upsert(&zone(109, "Renamed", 1)).unwrap();
-        assert_eq!(db.get(109).unwrap(), Some(zone(109, "Renamed", 1)));
+        assert_eq!(db.get(109).unwrap(), vec![zone(109, "Renamed", 1)]);
+
+        // The instances of a map are separate rows, outpost first.
+        db.upsert(&explorable(232, "Shadow's Passage", 2)).unwrap();
+        assert_eq!(
+            db.get(232).unwrap(),
+            vec![zone(232, "Shadow's Passage", 290923), explorable(232, "Shadow's Passage", 2)]
+        );
 
         let ids: Vec<u32> = db.all().unwrap().iter().map(|z| z.mapid).collect();
-        assert_eq!(ids, vec![5, 109, 232]);
+        assert_eq!(ids, vec![5, 109, 232, 232]);
     }
 
     #[test]
     fn set_mapfile_keeps_row() {
         let db = sample_db();
-        db.set_mapfile(109, Some(500)).unwrap();
-        assert_eq!(db.get(109).unwrap(), Some(zone(109, "The Amnoon Oasis", 500)));
-        db.set_mapfile(109, None).unwrap();
-        assert_eq!(db.get(109).unwrap().unwrap().mapfile, None);
-        db.set_mapfile(7, Some(600)).unwrap();
-        assert_eq!(db.get(7).unwrap(), Some(MapZone { mapid: 7, name: None, mapfile: Some(600), unknown: None }));
+        db.set_mapfile(109, Instance::Outpost, Some(500)).unwrap();
+        assert_eq!(db.get(109).unwrap(), vec![zone(109, "The Amnoon Oasis", 500)]);
+        db.set_mapfile(109, Instance::Outpost, None).unwrap();
+        assert_eq!(db.get(109).unwrap()[0].mapfile, None);
+        // A map's other instance gets a row named after the first.
+        db.set_mapfile(232, Instance::Explorable, Some(700)).unwrap();
+        let other = MapZone { unknown: None, ..explorable(232, "Shadow's Passage", 700) };
+        assert_eq!(db.get(232).unwrap(), vec![zone(232, "Shadow's Passage", 290923), other]);
+        db.set_mapfile(7, Instance::Outpost, Some(600)).unwrap();
+        let new = MapZone { mapid: 7, instance: Instance::Outpost, name: None, mapfile: Some(600), unknown: None };
+        assert_eq!(db.get(7).unwrap(), vec![new]);
     }
 
     #[test]
@@ -448,12 +584,13 @@ mod tests {
             let other = MapDb::open(&other_path).unwrap();
             other.upsert(&zone(109, "The Amnoon Oasis", 290943)).unwrap(); // unchanged
             other.upsert(&zone(232, "Shadow's Passage", 111)).unwrap(); // updated
+            other.upsert(&explorable(232, "Shadow's Passage", 333)).unwrap(); // inserted
             other.upsert(&zone(300, "New Map", 222)).unwrap(); // inserted
         }
 
         let mut db = sample_db();
         let report = db.import_from(&other_path).unwrap();
-        assert_eq!(report.inserted, vec![zone(300, "New Map", 222)]);
+        assert_eq!(report.inserted, vec![explorable(232, "Shadow's Passage", 333), zone(300, "New Map", 222)]);
         assert_eq!(
             report.updated,
             vec![(
@@ -462,9 +599,35 @@ mod tests {
             )]
         );
         assert_eq!(report.unchanged, 1);
-        assert_eq!(db.get(232).unwrap(), Some(zone(232, "Shadow's Passage", 111)));
-        assert_eq!(db.all().unwrap().len(), 3);
+        assert_eq!(
+            db.get(232).unwrap(),
+            vec![zone(232, "Shadow's Passage", 111), explorable(232, "Shadow's Passage", 333)]
+        );
+        assert_eq!(db.all().unwrap().len(), 4);
         assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    fn import_without_instance_only_reports() {
+        let dir = TempDir::new().unwrap();
+        let other_path = dir.path().join("maploadlog.db");
+        Connection::open(&other_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE map_zones (mapid INTEGER PRIMARY KEY, name TEXT, mapfile INTEGER, unknown INTEGER);
+                 INSERT INTO map_zones VALUES (109, 'The Amnoon Oasis', 290943, 0), (232, 'Shadow''s Passage', 111, 0);",
+            )
+            .unwrap();
+        let mut db = sample_db();
+        let before = db.all().unwrap();
+        let report = db.import_from(&other_path).unwrap();
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(
+            report.unplaced,
+            vec![UnplacedZone { mapid: 232, name: Some("Shadow's Passage".into()), mapfile: Some(111) }]
+        );
+        assert!(report.inserted.is_empty() && report.updated.is_empty());
+        assert_eq!(db.all().unwrap(), before);
     }
 
     #[test]
@@ -474,6 +637,7 @@ mod tests {
         let zero = zone(109, "Zero Mapfile", 0);
         let null = MapZone {
             mapid: 232,
+            instance: Instance::Outpost,
             name: Some("Null Mapfile".into()),
             mapfile: None,
             unknown: None,
@@ -492,8 +656,8 @@ mod tests {
         assert!(report.updated.is_empty());
         // New mapids are still inserted even without a mapfile.
         assert_eq!(report.inserted, vec![new_without_mapfile]);
-        assert_eq!(db.get(109).unwrap(), Some(zone(109, "The Amnoon Oasis", 290943)));
-        assert_eq!(db.get(232).unwrap(), Some(zone(232, "Shadow's Passage", 290923)));
+        assert_eq!(db.get(109).unwrap(), vec![zone(109, "The Amnoon Oasis", 290943)]);
+        assert_eq!(db.get(232).unwrap(), vec![zone(232, "Shadow's Passage", 290923)]);
     }
 
     #[test]
@@ -565,7 +729,13 @@ mod tests {
         let path = dir.path().join("mapfiles.db");
         std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/mapfiles.db"), &path).unwrap();
         let db = MapDb::open(&path).unwrap();
-        assert_eq!(db.get(109).unwrap(), Some(zone(109, "The Amnoon Oasis", 52918)));
-        assert_eq!(db.get(642).unwrap(), Some(zone(642, "Eye of the North", 288299)));
+        assert_eq!(db.get(109).unwrap(), vec![zone(109, "The Amnoon Oasis", 52918)]);
+        assert_eq!(db.get(642).unwrap(), vec![zone(642, "Eye of the North", 288299)]);
+        // A mission: its outpost's file, and a row for the mission's.
+        let wall = db.get(28).unwrap();
+        assert_eq!(wall.iter().map(|z| z.instance).collect::<Vec<_>>(), Instance::ALL);
+        assert!(wall[0].has_mapfile());
+        // An explorable area.
+        assert_eq!(db.get(13).unwrap()[0].instance, Instance::Explorable);
     }
 }

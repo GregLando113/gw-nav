@@ -12,7 +12,7 @@ use gw_nav::mapfile::zones::{self, ZonesStrip};
 use gw_nav::mapfile::{ChunkId, Ffna, parse_file_refs};
 use gw_nav::pathing::Progress;
 use gw_nav::fileconn::{ConnectionPool, Fetch, RawFile};
-use gw_nav::{AssetManifest, FileClient, MapDb, MapZone, PathingStore};
+use gw_nav::{AssetManifest, FileClient, Instance, MapDb, MapZone, PathingStore};
 use progress::{Board, Line};
 
 #[derive(Parser)]
@@ -31,11 +31,14 @@ enum Command {
     List,
     /// Search by name substring, or by mapid/mapfile if numeric.
     Search { query: String },
-    /// Show a single map zone.
+    /// Show a map zone's rows (outpost and explorable).
     Get { mapid: u32 },
-    /// Insert or replace a map zone.
+    /// Insert or replace a map zone's outpost or explorable row.
     Set {
         mapid: u32,
+        /// outpost or explorable.
+        #[arg(long)]
+        instance: Instance,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
@@ -210,17 +213,19 @@ fn main() -> Result<()> {
         Command::List => print_zones(&db.all()?),
         Command::Search { query } => print_zones(&db.search(&query)?),
         Command::Get { mapid } => match db.get(mapid)? {
-            Some(zone) => print_zones(&[zone]),
-            None => println!("mapid {mapid} not found"),
+            zones if zones.is_empty() => println!("mapid {mapid} not found"),
+            zones => print_zones(&zones),
         },
         Command::Set {
             mapid,
+            instance,
             name,
             mapfile,
             unknown,
         } => {
             let zone = MapZone {
                 mapid,
+                instance,
                 name,
                 mapfile,
                 unknown,
@@ -231,11 +236,12 @@ fn main() -> Result<()> {
         Command::Import { other } => {
             let report = db.import_from(&other)?;
             println!(
-                "inserted {}, updated {}, unchanged {}, skipped {} (no mapfile)",
+                "inserted {}, updated {}, unchanged {}, skipped {} (no mapfile), unplaced {} (no instance)",
                 report.inserted.len(),
                 report.updated.len(),
                 report.unchanged,
-                report.skipped.len()
+                report.skipped.len(),
+                report.unplaced.len()
             );
             for zone in &report.inserted {
                 println!("  + {}", format_zone(zone));
@@ -246,6 +252,16 @@ fn main() -> Result<()> {
             }
             for zone in &report.skipped {
                 println!("  ! {}", format_zone(zone));
+            }
+            for zone in &report.unplaced {
+                let mapfile = zone.mapfile.map_or("-".into(), |f| f.to_string());
+                println!(
+                    "  ? {:>6}  {:>10}  {:>8}  {}  (set its instance with `set --instance`)",
+                    zone.mapid,
+                    "",
+                    mapfile,
+                    zone.name.as_deref().unwrap_or("-")
+                );
             }
         }
         Command::Download { .. }
@@ -840,7 +856,7 @@ fn print_zone_chunk(path: &Path, vertices: bool) -> Result<()> {
 }
 
 fn print_zones(zones: &[MapZone]) {
-    println!("{:>6}  {:>8}  {:>7}  name", "mapid", "mapfile", "unknown");
+    println!("{:>6}  {:>10}  {:>8}  {:>7}  name", "mapid", "instance", "mapfile", "unknown");
     for zone in zones {
         println!("{}", format_zone(zone));
     }
@@ -849,8 +865,9 @@ fn print_zones(zones: &[MapZone]) {
 fn format_zone(zone: &MapZone) -> String {
     let opt = |v: Option<String>| v.unwrap_or_else(|| "-".into());
     format!(
-        "{:>6}  {:>8}  {:>7}  {}",
+        "{:>6}  {:>10}  {:>8}  {:>7}  {}",
         zone.mapid,
+        zone.instance.as_str(),
         opt(zone.mapfile.map(|v| v.to_string())),
         opt(zone.unknown.map(|v| v.to_string())),
         zone.name.as_deref().unwrap_or("-"),
