@@ -945,7 +945,7 @@ mod tests {
         let mut produced = 0u32;
         for i in 0..9000 {
             let r = xorshift(&mut rng);
-            if produced > 40 && r.is_multiple_of(5) {
+            if produced > 40 && r % 5 == 0 {
                 let len = MATCH_BONUS + 1 + r % 256;
                 let dist = 1 + (r >> 9) % produced.min(32768);
                 ops.push(Op::Copy { len, dist });
@@ -1002,7 +1002,7 @@ mod tests {
                 }
                 _ => ops.push(Op::Literal(r as u8)),
             }
-            if r.is_multiple_of(7) && !ops.is_empty() {
+            if r % 7 == 0 && !ops.is_empty() {
                 ops.push(Op::Copy {
                     len: MATCH_BONUS + 1 + r % 10,
                     dist: 1,
