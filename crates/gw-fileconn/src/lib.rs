@@ -11,7 +11,7 @@ pub mod manifest;
 pub mod pool;
 
 pub use client::{FILESERVER_FALLBACK_PORT, FILESERVER_PORT, Fetch, FileClient, RawFile};
-pub use decompress::{DecompressError, decompress};
+pub use decompress::{DecompressError, decompress, decompress_delta};
 pub use manifest::{AssetManifest, ManifestEntry, ManifestError, MapFileCandidate};
 pub use pool::{ConnectionPool, Pool, Pooled};
 
