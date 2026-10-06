@@ -21,6 +21,9 @@ pub mod tag {
     pub const INDEX_ARRAY: u8 = 4;
     pub const DATA_ARRAY: u8 = 5;
     pub const CHUNK_GRID: u8 = 7;
+    /// Optional, after the chunk grid: the shiny terrain settings
+    /// ([`super::TerrainShiny`]). The client reuses tag 3 for it.
+    pub const SHINY: u8 = 3;
     /// Stage 2 only: generated per-sample lighting.
     pub const LIGHTING: u8 = 9;
 }
@@ -133,6 +136,28 @@ pub struct TerrainSurface {
     pub water: Vec<u8>,
     /// Tag 7: one entry per chunk, chunk rows top to bottom.
     pub chunk_grid: Vec<ChunkGridEntry>,
+    /// The optional tag 3 after the chunk grid.
+    pub shiny: Option<TerrainShiny>,
+}
+
+/// The 17-byte tag 3 some maps have after the chunk grid, copied to stage 2
+/// unchanged (`Terrain_bloat_convert_chunk_info`). The client's stage-2
+/// reader (`TerrainChunk_ReadShinyConfig`) passes the floats to
+/// `TerrainShiny_Configure` in the order `values[3], values[2], values[0],
+/// values[1]`. Their meaning is unknown.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerrainShiny {
+    /// The first byte, which the client doesn't read.
+    pub unknown: u8,
+    pub values: [f32; 4],
+}
+
+impl TerrainShiny {
+    pub const SIZE: usize = 17;
+
+    fn read(r: &mut Reader) -> Result<Self> {
+        Ok(Self { unknown: r.u8()?, values: [r.f32()?, r.f32()?, r.f32()?, r.f32()?] })
+    }
 }
 
 impl TerrainSurface {
@@ -155,8 +180,15 @@ impl TerrainSurface {
                 Ok(ChunkGridEntry { data, shadow: r.array()? })
             })
             .collect::<Result<_>>()?;
+        let shiny = match r.peek_u8() {
+            Some(tag::SHINY) => {
+                r.strip_tag(tag::SHINY)?;
+                Some(TerrainShiny::read(r)?)
+            }
+            _ => None,
+        };
         r.strip_tag(TAG_END)?;
-        Ok(Self { textures, index_array, data_array, water, chunk_grid })
+        Ok(Self { textures, index_array, data_array, water, chunk_grid, shiny })
     }
 
     /// The stage-2 tag 7 payload, which the client writes back unchanged.
@@ -342,5 +374,40 @@ mod tests {
                 surface.index_array
             );
         }
+    }
+
+    /// The tags after the heights for one 32x32 chunk, with or without the
+    /// optional shiny tag (map file 190134 has one).
+    #[test]
+    fn reads_optional_shiny_tag() {
+        let surface_bytes = |shiny: Option<&[u8]>| {
+            let samples = CHUNK_SIZE * CHUNK_SIZE;
+            let mut b = vec![tag::TEXTURES];
+            b.extend(vec![1; samples]);
+            // Tags 4 and 5: empty packed arrays.
+            b.extend([tag::INDEX_ARRAY, 0, tag::DATA_ARRAY, 0, tag::WATER]);
+            b.extend(vec![0; samples / 4]);
+            b.extend([tag::CHUNK_GRID, 0, 0, 0, 0]);
+            b.extend([0; CHUNK_SHADOW_SIZE]);
+            if let Some(shiny) = shiny {
+                b.push(tag::SHINY);
+                b.extend(shiny);
+            }
+            b.push(TAG_END);
+            b
+        };
+        let read = |b: &[u8]| TerrainSurface::read(&mut Reader::new(b), [CHUNK_SIZE, CHUNK_SIZE]);
+
+        assert_eq!(read(&surface_bytes(None)).unwrap().shiny, None);
+        // The bytes from map file 190134 (revision 380831).
+        let shiny = [1, 0xd3, 0x4d, 0x82, 0x3e, 0xdd, 0xcc, 0x37, 0x45, 0x4e, 0x62, 0xb2, 0x44, 0x9c, 0xc4, 0xa0, 0x3e];
+        let surface = read(&surface_bytes(Some(&shiny))).unwrap();
+        let TerrainShiny { unknown, values } = surface.shiny.unwrap();
+        assert_eq!(unknown, 1);
+        assert_eq!(values.map(|v| (v * 100.0).round() / 100.0), [0.25, 2940.8, 1427.07, 0.31]);
+        // Anything but the end tag after it is still an error.
+        let mut bad = surface_bytes(Some(&shiny));
+        *bad.last_mut().unwrap() = 0x08;
+        assert!(read(&bad).is_err());
     }
 }

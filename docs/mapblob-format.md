@@ -229,7 +229,7 @@ u8  angle                                // radians = angle * 282.74335 / 45720
 u16 unknown
 u8, u8                                   // stored in stage 2 as n * 2 / 255
 u8  1                                    // tag 1: heights, TrnCodecHeight bit stream
-...                                      // tags 2, 4, 5, 3, 7, 0xFF
+...                                      // tags 2, 4, 5, 3, 7, optional 3, 0xFF
 ```
 
 Verified on 290943: dims 416 × 640, and 416·96 × 640·96 = 39936 × 61440, which equals the Map Parameters bounds. The client asserts this equality.
@@ -268,7 +268,7 @@ Stage-2 tag 1 is `dim_x * dim_y` f32 in the same **chunk-major** order: chunk in
 
 #### Tags after the heights (verified byte-exact against stage 2 for both samples; `mapfile::terrain::TerrainSurface`)
 
-After the heights, stage 1 has tags 2, 4, 5, 3, 7, then `0xFF`. Stage 2 has the same tags plus a generated tag 9 between 3 and 7. Everything except tags 4 and 5 is copied unchanged.
+After the heights, stage 1 has tags 2, 4, 5, 3, 7, an optional second tag 3, then `0xFF`. Stage 2 has the same tags plus a generated tag 9 between 3 and 7. Everything except tags 4 and 5 is copied unchanged.
 
 | tag | stage 1 | stage 2 |
 |---|---|---|
@@ -278,6 +278,7 @@ After the heights, stage 1 has tags 2, 4, 5, 3, 7, then `0xFF`. Stage 2 has the 
 | 3 | water mask, `dim_x * dim_y / 4` bytes (2 bits per sample) | the same |
 | 9 | — | `dim_x * dim_y` bytes of generated lighting (`Terrain_bloat_write_normals`) |
 | 7 | chunk grid: per 32×32 chunk, `u32 n, n bytes, 128 bytes shadow` (`TerrainChunkGrid_Deserialize`) | the same bytes, written back by `TerrainChunkGrid_Serialize` |
+| 3 (optional, after 7) | shiny terrain settings, 17 bytes: `u8 unknown, f32 v[4]` (`Terrain_bloat_convert_chunk_info @7594c0`). Map file 190134 has one: `1, 0.2545, 2940.8, 1427.07, 0.3140`. | the same; `TerrainChunk_ReadShinyConfig` passes `v[3], v[2], v[0], v[1]` to `TerrainShiny_Configure` |
 
 **Packed byte array** (`TrnBitStore`, MSB-first):
 - `count` in 8 bits; if it is 0, the tag is one byte long and empty
