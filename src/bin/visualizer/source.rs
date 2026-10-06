@@ -253,6 +253,8 @@ mod local {
                 let (text, fraction) = match p {
                     Progress::Connecting => ("Connecting to the fileserver".to_owned(), None),
                     Progress::Manifest => ("Downloading the asset manifest".to_owned(), None),
+                    // The steps below say what is downloading.
+                    Progress::Bytes { .. } => return,
                     Progress::Map(done, total) => {
                         ("Downloading the map file".to_owned(), fraction(done as usize, total as usize))
                     }

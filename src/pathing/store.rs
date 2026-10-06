@@ -38,6 +38,11 @@ pub type Result<T> = std::result::Result<T, PathingError>;
 pub enum Progress {
     Connecting,
     Manifest,
+    /// Bytes received of a file being downloaded from the fileserver
+    /// (compressed sizes), reported for every download: the asset manifest,
+    /// map files, models and textures. Downloads of different files can
+    /// interleave. A retried download starts again from 0.
+    Bytes { file_id: u32, done: u32, total: u32 },
     /// Downloading the map file: bytes done / total.
     Map(u32, u32),
     /// Downloading models: models done / total.
@@ -55,6 +60,14 @@ pub enum Progress {
 
 /// Downloaded files by base file id.
 type Files = HashMap<u32, Vec<u8>>;
+
+/// What a [`PathingStore::download_files`] worker reports: a download's
+/// [`Progress::Bytes`], or its `(base_id, file_id, data)` or error (and the
+/// file id, 0 if the worker could not connect).
+enum Fetched {
+    Bytes(Progress),
+    Done(std::result::Result<(u32, u32, Vec<u8>), (FileConnError, u32)>),
+}
 
 /// Cached, lazily connecting source of pathing data.
 ///
@@ -228,7 +241,7 @@ impl PathingStore {
         file_id: u32,
         progress: &mut impl FnMut(Progress),
     ) -> Result<(Vec<u8>, Files)> {
-        let map = self.download(file_id, |done, total| progress(Progress::Map(done, total)))?;
+        let map = self.download_map(file_id, progress)?;
         // The terrain textures and models, then the models' textures.
         let mut files = self.fetch_files(&render::required_files(&map)?, progress, Progress::RenderFiles, true)?;
         let textures = render::required_model_textures(&files);
@@ -268,7 +281,7 @@ impl PathingStore {
     /// Download and generate the stage-2 path chunk, without caching it.
     pub fn generate(&mut self, mapfile_id: u32, progress: &mut impl FnMut(Progress)) -> Result<Vec<u8>> {
         let manifest_file = self.manifest(progress)?.resolve(mapfile_id);
-        let map = self.download(manifest_file, |done, total| progress(Progress::Map(done, total)))?;
+        let map = self.download_map(manifest_file, progress)?;
         let inputs = MapInputs::parse(&map)?;
 
         // Pathing must not be generated (and cached) without a model.
@@ -290,7 +303,7 @@ impl PathingStore {
                 Ok(data) => data,
                 Err(_) => {
                     progress(Progress::Manifest);
-                    let data = client.download(id, |_, _| {})?;
+                    let data = client.download(id, |done, total| progress(Progress::Bytes { file_id: id, done, total }))?;
                     write_atomic(&path, &data)?;
                     data
                 }
@@ -337,13 +350,16 @@ impl PathingStore {
                     // Holds the connection until the queue is empty.
                     let mut client = match pool.get(|| {}) {
                         Ok(client) => client,
-                        Err(e) => return tx.send(Err((e, 0))).unwrap_or(()),
+                        Err(e) => return tx.send(Fetched::Done(Err((e, 0)))).unwrap_or(()),
                     };
                     loop {
                         let Some((base_id, file_id)) = queue.lock().expect("queue").pop() else { break };
                         let mut attempt = 0;
                         let result = loop {
-                            match client.download(file_id, |_, _| {}) {
+                            let bytes = |done, total| {
+                                let _ = tx.send(Fetched::Bytes(Progress::Bytes { file_id, done, total }));
+                            };
+                            match client.download(file_id, bytes) {
                                 Err(FileConnError::NotFound(id)) => break Err((FileConnError::NotFound(id), file_id)),
                                 Err(e) if attempt < RETRIES => {
                                     attempt += 1;
@@ -354,7 +370,7 @@ impl PathingStore {
                                 result => break result.map(|data| (base_id, file_id, data)).map_err(|e| (e, file_id)),
                             }
                         };
-                        if tx.send(result).is_err() {
+                        if tx.send(Fetched::Done(result)).is_err() {
                             break;
                         }
                     }
@@ -362,7 +378,14 @@ impl PathingStore {
             }
             drop(tx);
             let mut missing = 0;
-            for result in rx {
+            for fetched in rx {
+                let result = match fetched {
+                    Fetched::Bytes(bytes) => {
+                        progress(bytes);
+                        continue;
+                    }
+                    Fetched::Done(result) => result,
+                };
                 match result {
                     Ok((base_id, file_id, data)) => {
                         write_atomic(&self.file_path(file_id), &data)?;
@@ -392,6 +415,20 @@ impl PathingStore {
     /// the cache or the fileserver.
     pub fn map_file(&mut self, file_id: u32) -> Result<Vec<u8>> {
         self.download(file_id, |_, _| {})
+    }
+
+    /// [`Self::map_file`], reporting [`Progress::Bytes`] if it downloads.
+    pub fn map_file_with_progress(&mut self, file_id: u32, mut progress: impl FnMut(Progress)) -> Result<Vec<u8>> {
+        self.download(file_id, |done, total| progress(Progress::Bytes { file_id, done, total }))
+    }
+
+    /// A map file by exact file id, from the cache or the fileserver,
+    /// reporting both [`Progress::Map`] and [`Progress::Bytes`].
+    fn download_map(&mut self, file_id: u32, progress: &mut impl FnMut(Progress)) -> Result<Vec<u8>> {
+        self.download(file_id, |done, total| {
+            progress(Progress::Bytes { file_id, done, total });
+            progress(Progress::Map(done, total));
+        })
     }
 
     /// A file by exact file id if it is in the cache; never connects.

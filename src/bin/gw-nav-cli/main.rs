@@ -1,5 +1,6 @@
+mod progress;
+
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,6 +13,7 @@ use gw_nav::mapfile::{ChunkId, Ffna, parse_file_refs};
 use gw_nav::pathing::Progress;
 use gw_nav::fileconn::ConnectionPool;
 use gw_nav::{AssetManifest, FileClient, MapDb, MapZone, PathingStore};
+use progress::{Board, Line};
 
 #[derive(Parser)]
 #[command(about = "Guild Wars Navigator command line tool")]
@@ -269,8 +271,10 @@ fn asset_manifest(client: &mut FileClient, cache_dir: &Path) -> Result<AssetMani
     let data = match std::fs::read(&path) {
         Ok(data) => data,
         Err(_) => {
-            eprintln!("downloading asset manifest {id}");
-            let data = client.download(id, |_, _| {})?;
+            let board = Board::new();
+            let mut line = board.line();
+            line.start(format!("asset manifest {id}"));
+            let data = client.download(id, |done, total| line.progress(Progress::Bytes { file_id: id, done, total }))?;
             std::fs::create_dir_all(cache_dir)?;
             std::fs::write(&path, &data).with_context(|| format!("writing {}", path.display()))?;
             data
@@ -283,27 +287,30 @@ fn download(file_ids: &[u32], out_dir: &Path, save_raw: bool, cache_dir: Option<
     std::fs::create_dir_all(out_dir)?;
     let mut client = FileClient::connect()?;
     let manifest = cache_dir.map(|dir| asset_manifest(&mut client, dir)).transpose()?;
+    let board = Board::with_total(file_ids.len());
+    let mut line = board.line();
     for &id in file_ids {
         let current = manifest.as_ref().map_or(id, |m| m.resolve(id));
         if current != id {
-            println!("{id}: current revision is {current}");
+            board.println(format!("{id}: current revision is {current}"));
         }
-        let raw = match client.download_raw(current, |done, total| {
-            eprint!("\r{id}: {:5.1}% ({done}/{total} bytes)", 100.0 * done as f64 / total.max(1) as f64);
-            let _ = std::io::stderr().flush();
-        }) {
+        line.start(if current == id { id.to_string() } else { format!("{id} (r{current})") });
+        let raw = client.download_raw(current, |done, total| {
+            line.progress(Progress::Bytes { file_id: current, done, total })
+        });
+        board.inc(1);
+        let raw = match raw {
             Ok(raw) => raw,
             Err(gw_nav::FileConnError::NotFound(_)) => {
-                eprintln!("{id}: not found on fileserver");
+                board.eprintln(format!("{id}: not found on fileserver"));
                 continue;
             }
             Err(e) => return Err(e.into()),
         };
-        eprintln!();
-        println!(
+        board.println(format!(
             "{id}: compressed {} bytes, decompressed {} bytes, crc {:#010x}",
             raw.size_compressed, raw.size_decompressed, raw.crc
-        );
+        ));
         if save_raw {
             let path = out_dir.join(format!("{id}.cmp"));
             std::fs::write(&path, &raw.data).with_context(|| format!("writing {}", path.display()))?;
@@ -314,12 +321,12 @@ fn download(file_ids: &[u32], out_dir: &Path, save_raw: bool, cache_dir: Option<
         let path = out_dir.join(format!("{id}.mapblob"));
         std::fs::write(&path, &blob).with_context(|| format!("writing {}", path.display()))?;
         let magic = blob.get(..4).map(|m| String::from_utf8_lossy(m).into_owned());
-        println!(
+        board.println(format!(
             "{id}: saved {} (magic {:?}, type {:?})",
             path.display(),
             magic.unwrap_or_default(),
             blob.get(4)
-        );
+        ));
     }
     Ok(())
 }
@@ -329,63 +336,70 @@ fn fetch_models(mapfile_id: u32, out_dir: &Path, cache_dir: &Path, db: &Path) ->
     let mut client = FileClient::connect()?;
     let manifest = asset_manifest(&mut client, cache_dir)?;
     record_manifest(db, client.asset_manifest_id(), &manifest);
-    let map = client.download(manifest.resolve(mapfile_id), |_, _| {})?;
+    let map = {
+        let board = Board::new();
+        let mut line = board.line();
+        line.start(format!("map file {mapfile_id}"));
+        let file_id = manifest.resolve(mapfile_id);
+        client.download(file_id, |done, total| line.progress(Progress::Bytes { file_id, done, total }))?
+    };
     let map = Ffna::parse(&map)?;
     let refs = map.chunk(0x1100_0004).context("map has no prop file references")?;
     let ids = gw_nav::mapfile::parse_file_refs(refs)?;
     let mut fetched = 0;
+    let board = Board::with_total(ids.len());
+    let mut line = board.line();
     for id in &ids {
+        board.inc(1);
         let path = out_dir.join(format!("{id}.ffna"));
         if path.exists() {
             continue;
         }
-        match client.download(manifest.resolve(*id), |_, _| {}) {
+        let file_id = manifest.resolve(*id);
+        line.start(format!("model {id}"));
+        match client.download(file_id, |done, total| line.progress(Progress::Bytes { file_id, done, total })) {
             Ok(data) => {
                 std::fs::write(&path, data)?;
                 fetched += 1;
             }
-            Err(gw_nav::FileConnError::NotFound(_)) => eprintln!("{id}: not found"),
+            Err(gw_nav::FileConnError::NotFound(_)) => board.eprintln(format!("{id}: not found")),
             Err(e) => return Err(e.into()),
         }
     }
+    drop((line, board));
     println!("{} model refs, {fetched} downloaded", ids.len());
     Ok(())
 }
 
-fn print_progress(p: Progress) {
-    match p {
-        Progress::Connecting => eprintln!("connecting to the fileserver"),
-        Progress::Manifest => eprintln!("downloading the asset manifest"),
-        Progress::Map(done, total) => {
-            eprint!("\rmap file: {:5.1}%", 100.0 * done as f64 / total.max(1) as f64);
-            if done == total {
-                eprintln!();
-            }
+/// Show a map file's [`Progress`] on a line of `board`, printing missing
+/// files and render failures above it.
+fn map_progress(board: &Board, name: String) -> impl FnMut(Progress) + '_ {
+    let mut line = board.line();
+    line.start(name);
+    move |p| {
+        match p {
+            Progress::MissingFile(id) => board.eprintln(format!("file {id} not found, skipped")),
+            Progress::RenderFailed => board.eprintln("rendering failed"),
+            _ => {}
         }
-        Progress::Models(done, total) => {
-            eprint!("\rmodels: {done}/{total}");
-            if done == total {
-                eprintln!();
-            }
-        }
-        Progress::MissingFile(id) => eprintln!("\nfile {id} not found, skipped"),
-        Progress::Generating => eprintln!("generating"),
-        Progress::RenderFiles(done, total) => {
-            eprint!("\rrender files: {done}/{total}");
-            if done == total {
-                eprintln!();
-            }
-        }
-        Progress::Rendering => eprintln!("rendering"),
-        Progress::RenderFailed => eprintln!("rendering failed"),
+        line.progress(p);
     }
-    let _ = std::io::stderr().flush();
+}
+
+/// Load the asset manifest of `store`, showing its progress.
+fn load_manifest(store: &mut PathingStore) -> Result<()> {
+    let board = Board::new();
+    store.manifest(&mut map_progress(&board, "asset manifest".to_owned()))?;
+    Ok(())
 }
 
 fn pathing(mapfile_id: u32, refresh: bool, cache_dir: &Path, out: Option<&Path>, db: &Path) -> Result<()> {
     let mut store = PathingStore::new(cache_dir);
     let started = std::time::Instant::now();
-    let data = if refresh { store.fetch(mapfile_id, print_progress) } else { store.load(mapfile_id, print_progress) };
+    let board = Board::new();
+    let progress = map_progress(&board, format!("map file {mapfile_id}"));
+    let data = if refresh { store.fetch(mapfile_id, progress) } else { store.load(mapfile_id, progress) };
+    drop(board);
     record_store_manifest(db, &store);
     let data = data?;
     println!(
@@ -448,14 +462,18 @@ struct ImageDone {
     elapsed: Duration,
 }
 
-/// Bloat (generate the pathing data of) and render one map file.
-fn image_one(store: &mut PathingStore, job: ImageJob) -> ImageDone {
+/// Bloat (generate the pathing data of) and render one map file, showing
+/// its progress on `line`.
+fn image_one(store: &mut PathingStore, job: ImageJob, line: &mut Line) -> ImageDone {
     let started = Instant::now();
     let (mut missing, mut render_failed) = (0, false);
-    let mut progress = |p| match p {
-        Progress::MissingFile(_) => missing += 1,
-        Progress::RenderFailed => render_failed = true,
-        _ => {}
+    let mut progress = |p| {
+        match p {
+            Progress::MissingFile(_) => missing += 1,
+            Progress::RenderFailed => render_failed = true,
+            _ => {}
+        }
+        line.progress(p);
     };
     let result = if job.pathing {
         // Renders as well; a render failure is reported, not returned.
@@ -476,7 +494,7 @@ fn image_all(
 ) -> Result<()> {
     let pool = Arc::new(ConnectionPool::fileserver(connections));
     let mut store = PathingStore::with_pool(cache_dir, pool);
-    store.manifest(&mut print_progress)?;
+    load_manifest(&mut store)?;
     record_store_manifest(db_path, &store);
     let (manifest_id, manifest) = store.loaded_manifest().context("no asset manifest loaded")?;
     let mut db = MapDb::open(db_path)?;
@@ -537,13 +555,15 @@ fn image_all(
     let (tx, rx) = std::sync::mpsc::channel::<ImageDone>();
     let started = Instant::now();
     let (mut done, mut failed) = (0, 0);
+    let board = Board::with_total(total);
     std::thread::scope(|scope| -> Result<()> {
         for _ in 0..workers {
-            let (tx, queue, mut store) = (tx.clone(), &queue, store.share());
+            let (tx, queue, mut store, mut line) = (tx.clone(), &queue, store.share(), board.line());
             scope.spawn(move || {
                 loop {
                     let Some(job) = queue.lock().unwrap_or_else(|e| e.into_inner()).pop() else { break };
-                    if tx.send(image_one(&mut store, job)).is_err() {
+                    line.start(label(job.mapfile, job.revision));
+                    if tx.send(image_one(&mut store, job, &mut line)).is_err() {
                         break;
                     }
                 }
@@ -575,7 +595,8 @@ fn image_all(
                     format!("FAILED: {e:#}")
                 }
             };
-            println!("[{done:>4}/{total}] {}: {status} ({:.1?})", label(mapfile, revision), r.elapsed);
+            board.println(format!("[{done:>4}/{total}] {}: {status} ({:.1?})", label(mapfile, revision), r.elapsed));
+            board.inc(1);
             match file {
                 // Not a map after all; leave it out next time.
                 Some((false, _)) => db.set_is_map(mapfile, false)?,
@@ -588,6 +609,7 @@ fn image_all(
         }
         Ok(())
     })?;
+    drop(board);
     println!("imaged {} of {total} map files in {:.1?}", done - failed, started.elapsed());
     anyhow::ensure!(failed == 0, "{failed} map files failed");
     Ok(())
@@ -595,16 +617,18 @@ fn image_all(
 
 fn scan_zones(db_path: &Path, cache_dir: &Path, cached_only: bool) -> Result<()> {
     let mut store = PathingStore::new(cache_dir);
-    store.manifest(&mut print_progress)?;
+    load_manifest(&mut store)?;
     record_store_manifest(db_path, &store);
     let (_, manifest) = store.loaded_manifest().context("no asset manifest loaded")?;
     let mut db = MapDb::open(db_path)?;
     let files: Vec<(u32, u32)> = known_mapfiles(&db)?.into_iter().map(|f| (f, manifest.resolve(f))).collect();
 
     let (mut changed, mut unchanged, mut skipped, mut failed) = (0, 0, 0, 0);
-    for (i, &(mapfile, revision)) in files.iter().enumerate() {
-        eprint!("\rscanning {}/{}", i + 1, files.len());
-        let _ = std::io::stderr().flush();
+    let board = Board::with_total(files.len());
+    let mut line = board.line();
+    for &(mapfile, revision) in &files {
+        board.inc(1);
+        line.start(format!("{mapfile} (r{revision})"));
         let data = if cached_only {
             match store.cached_file(revision) {
                 Some(data) => data,
@@ -614,11 +638,11 @@ fn scan_zones(db_path: &Path, cache_dir: &Path, cached_only: bool) -> Result<()>
                 }
             }
         } else {
-            match store.map_file(revision) {
+            match store.map_file_with_progress(revision, |p| line.progress(p)) {
                 Ok(data) => data,
                 Err(e) => {
                     failed += 1;
-                    eprintln!("\n{mapfile} (revision {revision}): {e}");
+                    board.eprintln(format!("{mapfile} (revision {revision}): {e}"));
                     continue;
                 }
             }
@@ -638,11 +662,11 @@ fn scan_zones(db_path: &Path, cache_dir: &Path, cached_only: bool) -> Result<()>
             }
             Err(e) => {
                 failed += 1;
-                eprintln!("\n{mapfile} (revision {revision}): {e}");
+                board.eprintln(format!("{mapfile} (revision {revision}): {e}"));
             }
         }
     }
-    eprintln!();
+    drop((line, board));
     println!(
         "{} map files: {changed} recorded or updated, {unchanged} unchanged, {skipped} not cached, {failed} failed",
         files.len()
@@ -779,7 +803,9 @@ fn format_zone(zone: &MapZone) -> String {
 fn render(mapfile_id: u32, refresh: bool, cache_dir: &Path, out: Option<&Path>, db: &Path) -> Result<()> {
     let mut store = PathingStore::new(cache_dir);
     let started = std::time::Instant::now();
-    let loaded = store.load_render(mapfile_id, refresh, print_progress);
+    let board = Board::new();
+    let loaded = store.load_render(mapfile_id, refresh, map_progress(&board, format!("map file {mapfile_id}")));
+    drop(board);
     record_store_manifest(db, &store);
     let (file_id, data) = loaded?;
     let render = gw_nav::render::WorldRender::decode(&data)?;
@@ -802,7 +828,9 @@ fn render(mapfile_id: u32, refresh: bool, cache_dir: &Path, out: Option<&Path>, 
 fn render_preview(mapfile_id: u32, scale: f32, cache_dir: &Path, out: &Path, db: &Path) -> Result<()> {
     let mut store = PathingStore::new(cache_dir);
     let started = std::time::Instant::now();
-    let render = store.render_preview(mapfile_id, scale, print_progress);
+    let board = Board::new();
+    let render = store.render_preview(mapfile_id, scale, map_progress(&board, format!("map file {mapfile_id}")));
+    drop(board);
     record_store_manifest(db, &store);
     let render = render?;
     save_render(&render, out)?;
@@ -836,7 +864,7 @@ fn record_store_manifest(db: &Path, store: &PathingStore) {
 
 fn scan_manifest(db_path: &Path, cache_dir: &Path, verify: bool) -> Result<()> {
     let mut store = PathingStore::new(cache_dir);
-    store.manifest(&mut print_progress)?;
+    load_manifest(&mut store)?;
     let (id, manifest) = store.loaded_manifest().context("no asset manifest loaded")?;
     let candidates = manifest.map_file_candidates();
     let mut db = MapDb::open(db_path)?;
@@ -859,10 +887,12 @@ fn scan_manifest(db_path: &Path, cache_dir: &Path, verify: bool) -> Result<()> {
 
     let unchecked: Vec<_> = db.unlisted_mapfiles()?.into_iter().filter(|f| f.is_map.is_none()).collect();
     let (mut maps, mut others, mut failed) = (0, 0, 0);
-    for (i, f) in unchecked.iter().enumerate() {
-        eprint!("\rchecking {}/{}", i + 1, unchecked.len());
-        let _ = std::io::stderr().flush();
-        match store.map_file(f.revision) {
+    let board = Board::with_total(unchecked.len());
+    let mut line = board.line();
+    for f in &unchecked {
+        board.inc(1);
+        line.start(format!("{} (r{})", f.mapfile, f.revision));
+        match store.map_file_with_progress(f.revision, |p| line.progress(p)) {
             Ok(data) => {
                 let is_map = Ffna::parse(&data).is_ok_and(|file| file.file_type == TYPE_MAP);
                 db.set_is_map(f.mapfile, is_map)?;
@@ -870,16 +900,16 @@ fn scan_manifest(db_path: &Path, cache_dir: &Path, verify: bool) -> Result<()> {
                     maps += 1;
                 } else {
                     others += 1;
-                    eprintln!("\n{} (revision {}): not a map file", f.mapfile, f.revision);
+                    board.eprintln(format!("{} (revision {}): not a map file", f.mapfile, f.revision));
                 }
             }
             Err(e) => {
                 failed += 1;
-                eprintln!("\n{} (revision {}): {e}", f.mapfile, f.revision);
+                board.eprintln(format!("{} (revision {}): {e}", f.mapfile, f.revision));
             }
         }
     }
-    eprintln!();
+    drop((line, board));
     println!("checked {}: {maps} map files, {others} other files, {failed} failed", unchecked.len());
     Ok(())
 }
