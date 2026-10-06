@@ -1,13 +1,15 @@
 //! Points of interest beside the pathing data ([`MapAnnotations`]): the map
-//! file's mission points and portal props, and the zone exits recorded in
-//! game by gwbs (its `zones.db`, table `zone_exit`, keyed by map id).
+//! file's mission points, portal props and Zones chunk, and the zone exits
+//! recorded in game by gwbs (its `zones.db`, table `zone_exit`, keyed by map
+//! id).
 
 use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 
-use crate::api::{MapAnnotations, MapEntry, PortalProp, ZoneExit};
+use crate::api::{MapAnnotations, MapEntry, PortalProp, ZoneChunk, ZoneExit};
 use crate::mapfile::props::{PORTAL_MODELS, PropsStrip};
+use crate::mapfile::zones::ZonesStrip;
 use crate::mapfile::{Ffna, MapFileError, mission, parse_file_refs};
 use crate::{MapDb, MapDbError, PathingStore};
 
@@ -64,6 +66,24 @@ pub fn portal_props(file: &Ffna) -> Result<Vec<PortalProp>, MapFileError> {
         .collect())
 }
 
+/// The map file's stage-1 Zones chunk, with its file-reference list.
+pub fn zone_chunk(file: &Ffna) -> Result<ZoneChunk, MapFileError> {
+    let strip = ZonesStrip::parse(file.chunk(0x1000_0003).ok_or(MapFileError::MissingChunk(0x1000_0003))?)?;
+    let model_files = match file.chunk(0x1100_0003) {
+        Some(refs) => parse_file_refs(refs)?,
+        None => Vec::new(),
+    };
+    Ok(ZoneChunk { defs: strip.defs, zones: strip.zones, model_files })
+}
+
+/// Record in MapDb the zone def paths of revision `file_id` of map file
+/// `mapfile_id` ([`MapDb::record_zone_defs`]). Returns whether anything
+/// changed.
+pub fn record_zone_paths(db: &Path, mapfile_id: u32, file_id: u32, chunk: &ZoneChunk) -> Result<bool, MapDbError> {
+    let defs: Vec<(u32, &str)> = chunk.defs.iter().map(|d| (d.id, d.ini_path.as_str())).collect();
+    MapDb::open(db)?.record_zone_defs(mapfile_id, file_id, &defs)
+}
+
 /// Everything known about map file `mapfile_id` (revision `file_id`) beyond
 /// its pathing data. Missing parts are explained in `notes`.
 pub fn annotations(
@@ -88,6 +108,10 @@ pub fn annotations(
                 match portal_props(&file) {
                     Ok(props) => out.portal_props = props,
                     Err(e) => out.notes.push(format!("Portal props: {e}")),
+                }
+                match zone_chunk(&file) {
+                    Ok(chunk) => out.zone_chunk = Some(chunk),
+                    Err(e) => out.notes.push(format!("Zones chunk: {e}")),
                 }
             }
             Err(e) => out.notes.push(format!("Map file {file_id}: {e}")),
@@ -118,8 +142,20 @@ pub fn annotations(
 /// manifest that no row names.
 pub fn map_list(db: &Path) -> Result<Vec<MapEntry>, MapDbError> {
     let db = MapDb::open(db)?;
-    let rows = db.all()?.into_iter().map(|z| MapEntry { mapid: Some(z.mapid), name: z.name, mapfile: z.mapfile });
-    let unlisted = db.unlisted_mapfiles()?.into_iter().map(|f| MapEntry { mapid: None, name: None, mapfile: Some(f.mapfile) });
+    let paths = db.zone_paths()?;
+    let zone_paths = |mapfile: Option<u32>| mapfile.and_then(|f| paths.get(&f)).cloned().unwrap_or_default();
+    let rows = db.all()?.into_iter().map(|z| MapEntry {
+        mapid: Some(z.mapid),
+        name: z.name,
+        zone_paths: zone_paths(z.mapfile),
+        mapfile: z.mapfile,
+    });
+    let unlisted = db.unlisted_mapfiles()?.into_iter().map(|f| MapEntry {
+        mapid: None,
+        name: None,
+        mapfile: Some(f.mapfile),
+        zone_paths: zone_paths(Some(f.mapfile)),
+    });
     Ok(rows.chain(unlisted).collect())
 }
 
@@ -145,6 +181,26 @@ mod tests {
         assert_eq!(props.len(), 5);
         assert!(props.iter().all(|p| p.model == 247212));
         assert!(props.iter().any(|p| (p.x, p.y) == (787.0, 1053.0)));
+    }
+
+    #[test]
+    fn reads_zone_chunk() {
+        let Some(strip) = crate::mapfile::testdata::MapPair::all().find(|p| p.base_id == 290943).and_then(|p| p.strip())
+        else {
+            return;
+        };
+        let chunk = zone_chunk(&Ffna::parse(&strip).unwrap()).unwrap();
+        assert_eq!((chunk.defs.len(), chunk.zones.len(), chunk.model_files.len()), (6, 8, 123));
+        assert_eq!(chunk.model_starts(), [0, 21, 68, 70, 95, 99]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("maps.db");
+        assert!(record_zone_paths(&db, 290943, 381071, &chunk).unwrap());
+        assert!(!record_zone_paths(&db, 290943, 381071, &chunk).unwrap());
+        MapDb::open(&db).unwrap().upsert(&crate::MapZone { mapid: 546, name: None, mapfile: Some(290943), unknown: None }).unwrap();
+        let list = map_list(&db).unwrap();
+        assert_eq!(list[0].zone_paths.len(), 6);
+        assert!(list[0].zone_paths.iter().all(|p| p.starts_with(r"Chapter4\Missions\Mountain\Ridge\Zones\")));
     }
 
     #[test]

@@ -14,6 +14,7 @@ use crate::annotations::{self, Layers};
 use crate::source::{Event, Source};
 use crate::render::{DrawMap, Gpu, Mesh, corners, plane_color};
 use crate::waypoints::Waypointer;
+use crate::zone_chunk::{ListHover, ZoneView};
 
 /// Where to get data from.
 pub enum SourceKind {
@@ -52,6 +53,8 @@ struct LoadedMap {
     nav: NavMesh,
     /// Arrives shortly after the map.
     annotations: Option<MapAnnotations>,
+    /// The Zones chunk, from the annotations.
+    zones: Option<ZoneView>,
     /// The baked top-down render; arrives after the annotations.
     background: Option<Background>,
     bounds: [f32; 4],
@@ -276,7 +279,7 @@ impl Default for Settings {
             show_background: true,
             background_opacity: 1.0,
             show_planeless_props: true,
-            layers: Layers { points: true, portals: true, exits: true },
+            layers: Layers { points: true, portals: true, exits: true, zones: true },
             waypoint_window: true,
             show_maps_panel: true,
             show_layers_panel: false,
@@ -306,6 +309,8 @@ pub struct App {
     map_rect: Rect,
     /// The prop under the pointer in the Props list, outlined on the map.
     hovered_prop: Option<usize>,
+    /// The row under the pointer in the Zones list, highlighted on the map.
+    zone_list_hover: ListHover,
 }
 
 impl App {
@@ -346,6 +351,7 @@ impl App {
             waypointer,
             map_rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(800.0)),
             hovered_prop: None,
+            zone_list_hover: ListHover::default(),
         }
     }
 
@@ -378,6 +384,7 @@ impl App {
                 Event::Maps(Err(e)) => self.maps_error = Some(e),
                 Event::Annotations(id, a) => {
                     if let Some(map) = self.map.as_mut().filter(|m| m.data.mapfile_id == id) {
+                        map.zones = a.zone_chunk.clone().map(ZoneView::new);
                         map.annotations = Some(*a);
                     }
                 }
@@ -413,6 +420,7 @@ impl App {
             bounds: bounds(&data),
             nav,
             annotations: None,
+            zones: None,
             background: None,
             data,
             generation: self.generation,
@@ -491,6 +499,7 @@ impl App {
                     || z.name.as_deref().is_some_and(|n| n.to_lowercase().contains(&filter))
                     || z.mapid.is_some_and(|id| id.to_string().contains(&filter))
                     || z.mapfile.is_some_and(|f| f.to_string().contains(&filter))
+                    || z.zone_paths.iter().any(|p| p.to_lowercase().contains(&filter))
             })
             .collect();
         let mut clicked = None;
@@ -499,7 +508,8 @@ impl App {
             .sense(Sense::click())
             .column(Column::auto().at_least(40.0))
             .column(Column::auto().at_least(60.0))
-            .column(Column::remainder())
+            .column(Column::initial(170.0).at_least(60.0).clip(true).resizable(true))
+            .column(Column::remainder().clip(true))
             .header(20.0, |mut header| {
                 header.col(|ui| {
                     ui.strong("mapid");
@@ -509,6 +519,12 @@ impl App {
                 });
                 header.col(|ui| {
                     ui.strong("name");
+                });
+                header.col(|ui| {
+                    ui.strong("zones").on_hover_text(
+                        "The folder of the map file's zone def .ini paths (the developers' folder tree). Recorded \
+                         when a map file is loaded, or for all with `gw-nav-cli scan-zones`.",
+                    );
                 });
             })
             .body(|body| {
@@ -532,6 +548,11 @@ impl App {
                             ui.weak("unidentified (from manifest)").on_hover_text(
                                 "A map file in the fileserver's asset manifest that no MapDb row names yet.                                  Its map id is learned when GWBS logs the map being loaded.",
                             );
+                        }
+                    });
+                    row.col(|ui| {
+                        if let Some(folder) = zone_folder_summary(&zone.zone_paths) {
+                            ui.weak(folder).on_hover_text(zone.zone_paths.join("\n"));
                         }
                     });
                     if row.response().clicked() {
@@ -602,8 +623,9 @@ impl App {
         self.hovered_prop = None;
         let Some(map) = &mut self.map else { return };
         ui.separator();
-        // The two lists share the space left.
-        let half = (ui.available_height() / 2.0 - 40.0).max(120.0);
+        // The lists share the space left.
+        let lists = if map.zones.is_some() { 3.0 } else { 2.0 };
+        let half = (ui.available_height() / lists - 40.0).max(120.0);
         egui::CollapsingHeader::new(format!("Planes ({})", map.data.planes.len())).default_open(true).show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.small_button("all").clicked() {
@@ -629,6 +651,25 @@ impl App {
                 }
             });
         });
+        if let Some(zones) = &mut map.zones {
+            let title = format!("Zones ({} defs, {} zones)", zones.chunk.defs.len(), zones.chunk.zones.len());
+            let mut center = None;
+            egui::CollapsingHeader::new(title)
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("zones").max_height(half).show(ui, |ui| {
+                        center = zones.panel(ui, &mut self.zone_list_hover);
+                    });
+                })
+                .header_response
+                .on_hover_text(
+                    "The Zones chunk's defs, grouped by the folder of their .ini path, with their layers, models \
+                     and zones. Hover a zone to fill it on the map, click it to centre the map on it.",
+                );
+            if let Some(center) = center {
+                self.view.center = center;
+            }
+        }
         let Some(background) = &mut map.background else { return };
         egui::CollapsingHeader::new(format!("Props ({})", background.render.props.len()))
             .default_open(true)
@@ -710,6 +751,12 @@ impl App {
 
         let zones = &self.zones;
         let name = |id: u32| zones.iter().find(|z| z.mapid == Some(id)).and_then(|z| z.name.clone());
+        let zone_view = map.zones.as_ref().filter(|_| self.settings.layers.zones);
+        let zone_hit = zone_view.zip(hover).and_then(|(z, pos)| z.hit(view.to_world(rect, pos)));
+        if let Some(z) = zone_view {
+            let list = self.zone_list_hover;
+            z.paint(&painter, rect, view, list.zone.or(zone_hit), list.def);
+        }
         if let Some(a) = &map.annotations {
             annotations::paint(&painter, rect, view, a, &self.settings.layers, &name);
         }
@@ -729,6 +776,9 @@ impl App {
             && let Some(what) = annotations::hover(rect, view, a, &self.settings.layers, pos, &name)
         {
             text += &format!("\n{what}");
+        }
+        if let Some((z, i)) = zone_view.zip(zone_hit) {
+            text += &format!("\n{}", z.describe(i));
         }
         if let Some((i, w)) = self.waypointer.hovered() {
             text += &format!("\nwaypoint {i} (plane {})", w.plane);
@@ -765,6 +815,8 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_events(&ui.ctx().clone());
+        // Set again by the Zones list if it is shown.
+        self.zone_list_hover = ListHover::default();
         let mapid = self.loaded_mapid();
         self.waypointer.set_map(mapid);
         egui::Panel::top("status").show(ui, |ui| {
@@ -798,6 +850,26 @@ impl eframe::App for App {
         let default_pos = self.map_rect.right_top() + Vec2::new(-340.0, 40.0);
         self.waypointer.window(ui.ctx(), default_pos, self.map.as_ref().map(|m| &m.nav));
     }
+}
+
+/// The Maps list's zones column: the most common folder among a map file's
+/// zone def paths, with `+N` for the other folders.
+fn zone_folder_summary(paths: &[String]) -> Option<String> {
+    let mut folders: Vec<(&str, usize)> = Vec::new();
+    for path in paths {
+        let folder = gw_nav::mapfile::zones::short_folder(path);
+        match folders.iter_mut().find(|(f, _)| *f == folder) {
+            Some((_, n)) => *n += 1,
+            None => folders.push((folder, 1)),
+        }
+    }
+    // Stable, so ties keep the first folder seen.
+    folders.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    let (first, _) = folders.first()?;
+    Some(match folders.len() {
+        1 => first.to_string(),
+        n => format!("{first} +{}", n - 1),
+    })
 }
 
 /// The topmost visible plane containing `p` (trying `prefer` first) and
@@ -847,6 +919,20 @@ mod tests {
         assert!((back[0] - w[0]).abs() < 1e-2 && (back[1] - w[1]).abs() < 1e-2);
         // World y up is screen y down.
         assert!(view.to_screen(rect, [100.0, 0.0]).y < view.to_screen(rect, [100.0, -100.0]).y);
+    }
+
+    #[test]
+    fn zone_folder_column() {
+        let paths: Vec<String> = [
+            r"Chapter3\Missions\Badlands\Sulphur\Zones\SulpherGrass.ini",
+            r"Chapter3\Missions\Highlands\Tower\Zones\HighlandsTowerLight.ini",
+            r"Chapter3\Missions\Badlands\Sulphur\Zones\SulpherBlackRocks.ini",
+        ]
+        .map(String::from)
+        .into();
+        assert_eq!(zone_folder_summary(&paths).as_deref(), Some(r"Badlands\Sulphur +1"));
+        assert_eq!(zone_folder_summary(&paths[1..2]).as_deref(), Some(r"Highlands\Tower"));
+        assert_eq!(zone_folder_summary(&[]), None);
     }
 
     #[test]

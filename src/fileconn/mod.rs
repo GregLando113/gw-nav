@@ -3,10 +3,12 @@
 mod client;
 pub mod decompress;
 pub mod manifest;
+pub mod pool;
 
 pub use client::{FILESERVER_PORT, FileClient, RawFile};
 pub use decompress::{DecompressError, decompress};
 pub use manifest::{AssetManifest, ManifestEntry, ManifestError, MapFileCandidate};
+pub use pool::{ConnectionPool, Pool, Pooled};
 
 #[derive(thiserror::Error, Debug)]
 pub enum FileConnError {

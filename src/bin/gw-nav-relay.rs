@@ -165,6 +165,11 @@ fn annotations(state: &State, mapfile_id: u32) -> Response<std::io::Cursor<Vec<u
         return text(404, format!("map file {mapfile_id} is not loaded"));
     };
     let a = gw_nav::zones::annotations(&mut store, &state.db, state.zones_db.as_deref(), mapfile_id, file_id);
+    if let Some(chunk) = &a.zone_chunk
+        && let Err(e) = gw_nav::zones::record_zone_paths(&state.db, mapfile_id, file_id, chunk)
+    {
+        eprintln!("recording zone def paths in {}: {e}", state.db.display());
+    }
     Response::from_data(serde_json::to_vec(&a).expect("serializable")).with_header(header("Content-Type", "application/json"))
 }
 
@@ -236,7 +241,12 @@ mod tests {
         let mut body = String::new();
         maps(&state).into_reader().read_to_string(&mut body).context("reading body")?;
         let entries: Vec<MapEntry> = serde_json::from_str(&body)?;
-        assert_eq!(entries, vec![MapEntry { mapid: Some(546), name: Some("Jaga Moraine".into()), mapfile: Some(290943) }]);
+        assert_eq!(entries, vec![MapEntry {
+                mapid: Some(546),
+                name: Some("Jaga Moraine".into()),
+                mapfile: Some(290943),
+                zone_paths: vec![],
+            }]);
         assert_eq!(static_file(dir.path(), "/missing.html").status_code().0, 404);
         assert_eq!(annotations(&state, 290943).status_code().0, 404);
         Ok(())

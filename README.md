@@ -91,6 +91,9 @@ The `gw-nav-cli` binary covers the MapDb and the data pipeline, and builds witho
 | `render <mapfile_id> [--refresh] [--out x.jpg]` | Load or bake a map's top-down render |
 | `render <mapfile_id> --scale <units/px> --out x.png` | Render a preview at another resolution, uncached |
 | `scan-manifest [--verify]` | Record the asset manifest's map files that no map row names; `--verify` downloads them to check |
+| `image-all [--jobs N] [--connections N] [--limit N] [--dry-run]` | Like the game client's `-image`: download, bloat and render every known map file whose current revision isn't cached, N maps at a time over a shared fileserver connection pool |
+| `scan-zones [--cached-only]` | Record every map file's zone def `.ini` paths, for the visualizer's Maps list |
+| `zone-chunk <file> [--no-vertices]` | Dump a map file's Zones chunk in readable form |
 
 ## Data and caching
 

@@ -57,7 +57,7 @@ Downloads come back compressed. `fileconn::decompress` decodes them, given the d
 3. Download the models of props without flag bit 0, over 4 connections.
 4. Run `pathgen` and cache the resulting stage-2 path chunk as `pathing/<mapfile_id>-r<file_id>-v<FORMAT_VERSION>.path`.
 
-Downloads are cached in `files/<file_id>.bin`, keyed by the exact revision. A cold load of Jaga Moraine (157 models) takes about 8 s, a cached load under 1 ms. The CLI is `gw-nav-cli pathing <mapfile_id> [--refresh]`. Tag 13 (obstacles) is written empty until zone placement is ported; bump `FORMAT_VERSION` when it is.
+Downloads are cached in `files/<file_id>.bin`, keyed by the exact revision. A cold load of Jaga Moraine (157 models) takes about 8 s, a cached load under 1 ms. The CLI is `gw-nav-cli pathing <mapfile_id> [--refresh]`. `gw-nav-cli image-all` does this for every known map file whose current revision isn't cached (pathing and render), like the game client's `-image`. It runs `--jobs` maps at once (default 4), and all of them share one pool of `--connections` fileserver connections (default 8, `fileconn::ConnectionPool`). Stores made with `PathingStore::share` use the same pool and asset manifest. Tag 13 (obstacles) is written empty until zone placement is ported; bump `FORMAT_VERSION` when it is.
 
 ## 2. FFNA container (verified)
 
@@ -395,23 +395,23 @@ This needs the zone bloat plus the placement generator ported. The trapezoids, p
 ### 7b.1 Zone placement research (from Ghidra; not ported)
 The findings are recorded here so the port can start from them.
 
-**Zones chunk, stage 1** (`0x10000003`): `u32 0x59220320, u8 10`, then tagged sections (bare `u8` tag, `u32` length).
+**Zones chunk, stage 1** (`0x10000003`; layout verified on 290943, 290923 and 214315, parsed by `mapfile::zones`): `u32 0x59220320, u8 10`, then tagged sections (bare `u8` tag, `u32` length). `gw-nav-cli zone-chunk <file.mapblob> [--no-vertices]` dumps it in readable form, with each model's file id and each layer's mip level.
 - **Tag 1, zone defs:** `u32 count`, then per def:
-  - `u32 id`, then a NUL-terminated UTF-16 `.ini` path, which stage 2 drops
+  - `u32 id`, then a NUL-terminated UTF-16 `.ini` path, which stage 2 drops. The paths follow the developers' folder tree, `Chapter<N>\Missions\<Region>\<Area>\Zones\<Def>.ini`, or `Missions\GuildWars\<Area>\Zones\<Def>.ini` in Prophecies maps (e.g. `Chapter3\Missions\Nightmare\Town\Zones\NightmareTownCreepy.ini` in 214315, the Domain of Anguish gates). Defs are shared between maps, and one map can use defs from several folders (380873 uses Highlands\Tower, Badlands\Sulphur and Lowlands\Rough). MapDb records each map file's paths in `mapfile_zone_defs` when the visualizer or relay loads it, or for every known map file with `gw-nav-cli scan-zones [--cached-only]`. The visualizer shows the folder in its Maps list, which helps place unidentified map files.
   - `u32 layer_count (L)`, `u32 model_count (M)`
   - per-layer arrays, each of length L, in this order:
-    - `u32 type` (0 or 2)
+    - `u32 type` (0, 1 or 2; 1 seen once, on 290943)
     - `f32 spacing`
     - `f32 collision_radius`
     - `f32 density`
     - `f32 scale_variance` (≤ 0.5)
     - `u8 pattern` (0–4)
     - `u32 models_in_layer`
-  - per-model arrays, each of length M: `f32 cumulative_probability`, then `u32 flags`
+  - per-model arrays, each of length M: `f32 cumulative_probability`, then `u32 flags`. The models are grouped by layer (`models_in_layer` each), and the probability is cumulative within a layer, ending at 1.0 (sometimes 0.9999999).
 
   `ZoneDef_Create @76f7f0` sets the layer's mip level to the smallest `l` in 0..4 with `spacing < 2^l · 96 · 0.1`, and 4 if there is none. Only levels ≥ 2 are generated for path obstacles.
 - **Models** aren't named in the def. They are the zones file-reference list (`0x11000003`), consumed in order across the defs. For EotN that is 27 + 27 + 6 = 60 references.
-- **Tag 2, prop files** (`ZoneData_ReadPropFiles`): `u8 n`, `n × u32` model indices, then nibble-coded texture atlas sizes. Rendering only.
+- **Tag 2, prop files** (`ZoneData_ReadPropFiles`): `u8 n`, `n × u32` model indices, then texture atlas sizes, one nibble per model, low nibble first (`ceil(n/2)` bytes; values `0x9` and `0xa` so far). Rendering only. On all three samples the indices are exactly the models of the level-0 layers, deduplicated by file id (first occurrence kept).
 - **Tag 3, zones:** `u32 count`, then per zone:
   - `u32 def id`, `u8 flags`
   - `u16 height`, where `height = h · 0.76293945 − 25000`

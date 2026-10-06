@@ -6,7 +6,12 @@
 //! A second table, `manifest_mapfiles`, holds the map files found in the
 //! fileserver's asset manifest ([`MapDb::record_manifest`]). The manifest
 //! has no map ids, so they are kept apart from `map_zones`.
+//!
+//! A third, `mapfile_zone_defs`, holds the zone def `.ini` paths found in
+//! each map file's Zones chunk ([`MapDb::record_zone_defs`]). They follow
+//! the developers' folder tree, which helps place unidentified map files.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
@@ -26,6 +31,13 @@ CREATE TABLE IF NOT EXISTS manifest_mapfiles (
     manifest INTEGER NOT NULL,
     dependencies INTEGER NOT NULL,
     is_map INTEGER
+);
+CREATE TABLE IF NOT EXISTS mapfile_zone_defs (
+    mapfile INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    def_id INTEGER NOT NULL,
+    ini_path TEXT NOT NULL,
+    PRIMARY KEY (mapfile, def_id)
 );";
 
 const SELECT_COLUMNS: &str = "SELECT mapid, name, mapfile, unknown FROM map_zones";
@@ -222,6 +234,46 @@ impl MapDb {
     /// All `manifest_mapfiles` rows, by mapfile.
     pub fn manifest_mapfiles(&self) -> Result<Vec<ManifestMapFile>> {
         query_manifest_mapfiles(&self.conn, "")
+    }
+
+    /// Record the zone defs (`(def id, .ini path)`) of revision `revision`
+    /// of map file `mapfile`, replacing what was recorded for it. Returns
+    /// whether anything changed.
+    pub fn record_zone_defs(&mut self, mapfile: u32, revision: u32, defs: &[(u32, &str)]) -> Result<bool> {
+        let tx = self.conn.transaction()?;
+        let old: Vec<(u32, u32, String)> = {
+            let mut stmt =
+                tx.prepare("SELECT revision, def_id, ini_path FROM mapfile_zone_defs WHERE mapfile = ?1 ORDER BY def_id")?;
+            stmt.query_map([mapfile], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut new: Vec<(u32, u32, String)> = defs.iter().map(|&(id, path)| (revision, id, path.to_owned())).collect();
+        new.sort_by_key(|&(_, id, _)| id);
+        new.dedup_by_key(|&mut (_, id, _)| id);
+        if old == new {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM mapfile_zone_defs WHERE mapfile = ?1", [mapfile])?;
+        for (revision, id, path) in &new {
+            tx.execute(
+                "INSERT INTO mapfile_zone_defs (mapfile, revision, def_id, ini_path) VALUES (?1, ?2, ?3, ?4)",
+                params![mapfile, revision, id, path],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The distinct zone def paths recorded for each map file, sorted.
+    pub fn zone_paths(&self) -> Result<HashMap<u32, Vec<String>>> {
+        let mut stmt =
+            self.conn.prepare("SELECT DISTINCT mapfile, ini_path FROM mapfile_zone_defs ORDER BY mapfile, ini_path")?;
+        let mut out: HashMap<u32, Vec<String>> = HashMap::new();
+        for row in stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))? {
+            let (mapfile, path) = row?;
+            out.entry(mapfile).or_default().push(path);
+        }
+        Ok(out)
     }
 
     /// The manifest's map files that no `map_zones` row names, less those
@@ -464,6 +516,25 @@ mod tests {
         // Once GWBS logs a map with that file, it is listed under its mapid.
         db.upsert(&zone(900, "Found", 700)).unwrap();
         assert_eq!(mapfiles(db.unlisted_mapfiles().unwrap()), [500]);
+    }
+
+    #[test]
+    fn records_zone_defs() {
+        let mut db = sample_db();
+        let a = r"Chapter3\Missions\Nightmare\Town\Zones\NightmareTownGrass.ini";
+        let b = r"Chapter3\Missions\Nightmare\Town\Zones\NightmareTownCreepy.ini";
+        assert!(db.record_zone_defs(214315, 380854, &[(2, a), (1, b)]).unwrap());
+        assert!(!db.record_zone_defs(214315, 380854, &[(1, b), (2, a)]).unwrap());
+        assert!(db.record_zone_defs(500, 501, &[(1, a)]).unwrap());
+        let paths = db.zone_paths().unwrap();
+        assert_eq!(paths[&214315], [b, a]);
+        assert_eq!(paths[&500], [a]);
+
+        // A new revision replaces the old rows.
+        assert!(db.record_zone_defs(214315, 390000, &[(1, a)]).unwrap());
+        assert_eq!(db.zone_paths().unwrap()[&214315], [a]);
+        assert!(db.record_zone_defs(500, 501, &[]).unwrap());
+        assert!(!db.zone_paths().unwrap().contains_key(&500));
     }
 
     #[test]

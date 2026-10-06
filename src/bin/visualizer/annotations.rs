@@ -1,5 +1,5 @@
 //! The mission-point, portal-prop and zone-exit layers
-//! ([`MapAnnotations`]).
+//! ([`MapAnnotations`]). The Zones chunk is drawn by `zone_chunk`.
 
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 use gw_nav::api::MapAnnotations;
@@ -24,6 +24,13 @@ pub struct Layers {
     pub points: bool,
     pub portals: bool,
     pub exits: bool,
+    /// Missing from settings saved before it existed.
+    #[serde(default = "on")]
+    pub zones: bool,
+}
+
+fn on() -> bool {
+    true
 }
 
 fn color(a: &MapAnnotations, p: &MissionPoint) -> Color32 {
@@ -62,6 +69,11 @@ pub fn panel(ui: &mut egui::Ui, a: Option<&MapAnnotations>, layers: &mut Layers)
     );
     ui.checkbox(&mut layers.exits, format!("Zone exits ({exits})"))
         .on_hover_text("Zone transitions recorded in game (gwbs zones.db), with the direction of travel");
+    let zones = a.and_then(|a| a.zone_chunk.as_ref()).map_or(0, |c| c.zones.len());
+    ui.checkbox(&mut layers.zones, format!("Zones chunk ({zones})")).on_hover_text(
+        "The map file's Zones chunk: areas the client fills with grass, trees and rocks, outlined in the colour \
+         of their def. Not zone (map) transitions. Defs can be hidden in the Zones list.",
+    );
     for note in a.map_or(&[][..], |a| &a.notes[..]) {
         ui.colored_label(ui.visuals().weak_text_color(), egui::RichText::new(note).small());
     }

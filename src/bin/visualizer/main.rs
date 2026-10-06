@@ -15,6 +15,7 @@ mod clipboard;
 mod render;
 mod source;
 mod waypoints;
+mod zone_chunk;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {

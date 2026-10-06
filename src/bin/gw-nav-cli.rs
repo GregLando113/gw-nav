@@ -1,12 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use gw_nav::mapfile::ffna::TYPE_MAP;
-use gw_nav::mapfile::{ChunkId, Ffna};
+use gw_nav::mapfile::zones::{self, ZonesStrip};
+use gw_nav::mapfile::{ChunkId, Ffna, parse_file_refs};
 use gw_nav::pathing::Progress;
+use gw_nav::fileconn::ConnectionPool;
 use gw_nav::{AssetManifest, FileClient, MapDb, MapZone, PathingStore};
 
 #[derive(Parser)]
@@ -63,6 +67,14 @@ enum Command {
     Manifest,
     /// List the chunks of a downloaded FFNA file.
     Chunks { path: PathBuf },
+    /// Dump the zones chunk (procedural foliage zones) of a stage-1 map
+    /// file in readable form.
+    ZoneChunk {
+        path: PathBuf,
+        /// Leave out the zone polygons' vertices.
+        #[arg(long)]
+        no_vertices: bool,
+    },
     /// Download the prop models referenced by a map file (current
     /// revisions), saved as <base_id>.ffna. Existing files are kept.
     FetchModels {
@@ -112,6 +124,35 @@ enum Command {
         #[arg(long, default_value = "cache")]
         cache_dir: PathBuf,
     },
+    /// Record the zone def .ini paths of every known map file (table
+    /// mapfile_zone_defs), for the Maps list. Loading a map in the
+    /// visualizer records its paths too.
+    ScanZones {
+        /// Only read map files already in the cache; don't download any.
+        #[arg(long)]
+        cached_only: bool,
+        #[arg(long, default_value = "cache")]
+        cache_dir: PathBuf,
+    },
+    /// Download, bloat and render every known map file whose current
+    /// revision isn't cached yet, like the game client's -image. Map files
+    /// come from MapDb and the asset manifest's map file candidates.
+    ImageAll {
+        /// Map files processed at once.
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+        /// Fileserver connections shared by all jobs.
+        #[arg(long, default_value_t = 8)]
+        connections: usize,
+        /// Process at most this many map files.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Only list the map files that would be processed.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, default_value = "cache")]
+        cache_dir: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -141,8 +182,17 @@ fn main() -> Result<()> {
     if let Command::ScanManifest { verify, cache_dir } = &cli.command {
         return scan_manifest(&cli.db, cache_dir, *verify);
     }
+    if let Command::ScanZones { cached_only, cache_dir } = &cli.command {
+        return scan_zones(&cli.db, cache_dir, *cached_only);
+    }
+    if let Command::ImageAll { jobs, connections, limit, dry_run, cache_dir } = &cli.command {
+        return image_all(&cli.db, cache_dir, *jobs, *connections, *limit, *dry_run);
+    }
     if let Command::Chunks { path } = &cli.command {
         return print_chunks(path);
+    }
+    if let Command::ZoneChunk { path, no_vertices } = &cli.command {
+        return print_zone_chunk(path, !*no_vertices);
     }
     if let Command::Manifest = &cli.command {
         let client = FileClient::connect()?;
@@ -198,10 +248,13 @@ fn main() -> Result<()> {
         Command::Download { .. }
         | Command::Manifest
         | Command::Chunks { .. }
+        | Command::ZoneChunk { .. }
         | Command::FetchModels { .. }
         | Command::Pathing { .. }
         | Command::Render { .. }
-        | Command::ScanManifest { .. } => {
+        | Command::ScanManifest { .. }
+        | Command::ScanZones { .. }
+        | Command::ImageAll { .. } => {
             unreachable!("handled above")
         }
     }
@@ -362,6 +415,345 @@ fn print_chunks(path: &Path) -> Result<()> {
         };
         let head: String = chunk.data.iter().take(12).map(|b| format!("{b:02x}")).collect();
         println!("{:#010x}  {:>9}  {:<24}  {head}", chunk.id, chunk.data.len(), name);
+    }
+    Ok(())
+}
+
+/// The map files of `map_zones` and `manifest_mapfiles`, less those checked
+/// not to be maps, by id.
+fn known_mapfiles(db: &MapDb) -> Result<Vec<u32>> {
+    let mut mapfiles: Vec<u32> = db.all()?.iter().filter_map(|z| z.mapfile).filter(|&f| f != 0).collect();
+    mapfiles.extend(db.manifest_mapfiles()?.iter().filter(|f| f.is_map != Some(false)).map(|f| f.mapfile));
+    mapfiles.sort_unstable();
+    mapfiles.dedup();
+    Ok(mapfiles)
+}
+
+/// A map file for `image-all` to process.
+struct ImageJob {
+    mapfile: u32,
+    /// The current revision.
+    revision: u32,
+    /// The pathing data isn't cached (generating it renders too).
+    pathing: bool,
+}
+
+/// What a job did.
+struct ImageDone {
+    job: ImageJob,
+    result: Result<()>,
+    /// Models and textures missing from the fileserver.
+    missing: usize,
+    render_failed: bool,
+    elapsed: Duration,
+}
+
+/// Bloat (generate the pathing data of) and render one map file.
+fn image_one(store: &mut PathingStore, job: ImageJob) -> ImageDone {
+    let started = Instant::now();
+    let (mut missing, mut render_failed) = (0, false);
+    let mut progress = |p| match p {
+        Progress::MissingFile(_) => missing += 1,
+        Progress::RenderFailed => render_failed = true,
+        _ => {}
+    };
+    let result = if job.pathing {
+        // Renders as well; a render failure is reported, not returned.
+        store.load_chunk(job.mapfile, true, &mut progress).map(drop)
+    } else {
+        store.bake_render(job.mapfile, job.revision, &mut progress).map(drop)
+    };
+    ImageDone { job, result: result.map_err(Into::into), missing, render_failed, elapsed: started.elapsed() }
+}
+
+fn image_all(
+    db_path: &Path,
+    cache_dir: &Path,
+    jobs: usize,
+    connections: usize,
+    limit: Option<usize>,
+    dry_run: bool,
+) -> Result<()> {
+    let pool = Arc::new(ConnectionPool::fileserver(connections));
+    let mut store = PathingStore::with_pool(cache_dir, pool);
+    store.manifest(&mut print_progress)?;
+    record_store_manifest(db_path, &store);
+    let (manifest_id, manifest) = store.loaded_manifest().context("no asset manifest loaded")?;
+    let mut db = MapDb::open(db_path)?;
+    let mut names: HashMap<u32, String> = HashMap::new();
+    for zone in db.all()? {
+        if let (Some(mapfile), Some(name)) = (zone.mapfile, zone.name) {
+            names.entry(mapfile).or_insert(name);
+        }
+    }
+
+    // The fileserver only has the map files the manifest lists.
+    let (known, unlisted): (Vec<u32>, Vec<u32>) =
+        known_mapfiles(&db)?.into_iter().partition(|&f| manifest.get(f).is_some());
+    let mut queue: Vec<ImageJob> = known
+        .iter()
+        .map(|&mapfile| {
+            let revision = manifest.resolve(mapfile);
+            ImageJob { mapfile, revision, pathing: !store.has_pathing(mapfile, revision) }
+        })
+        .filter(|j| j.pathing || !store.has_render(j.mapfile, j.revision))
+        .collect();
+    let pathing = queue.iter().filter(|j| j.pathing).count();
+    println!(
+        "asset manifest {manifest_id}: {} map files, {} imaged, {} to do ({pathing} need pathing and a render, {} a render)",
+        known.len(),
+        known.len() - queue.len(),
+        queue.len(),
+        queue.len() - pathing,
+    );
+    if !unlisted.is_empty() {
+        let ids: Vec<String> = unlisted.iter().map(|f| f.to_string()).collect();
+        println!("skipped {} map files the asset manifest doesn't list: {}", unlisted.len(), ids.join(", "));
+    }
+    if let Some(limit) = limit {
+        queue.truncate(limit);
+    }
+    let label = |mapfile: u32, revision: u32| match names.get(&mapfile) {
+        Some(name) => format!("{mapfile} {name} (r{revision})"),
+        None => format!("{mapfile} (r{revision})"),
+    };
+    if dry_run {
+        for job in &queue {
+            let what = if job.pathing { "pathing + render" } else { "render" };
+            println!("  {}: {what}", label(job.mapfile, job.revision));
+        }
+        return Ok(());
+    }
+    if queue.is_empty() {
+        return Ok(());
+    }
+
+    let total = queue.len();
+    let workers = jobs.clamp(1, total);
+    println!("imaging {total} map files with {workers} jobs over up to {connections} connections");
+    // Pop from the end; keep the id order.
+    queue.reverse();
+    let queue = Mutex::new(queue);
+    let (tx, rx) = std::sync::mpsc::channel::<ImageDone>();
+    let started = Instant::now();
+    let (mut done, mut failed) = (0, 0);
+    std::thread::scope(|scope| -> Result<()> {
+        for _ in 0..workers {
+            let (tx, queue, mut store) = (tx.clone(), &queue, store.share());
+            scope.spawn(move || {
+                loop {
+                    let Some(job) = queue.lock().unwrap_or_else(|e| e.into_inner()).pop() else { break };
+                    if tx.send(image_one(&mut store, job)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        // Results arrive as jobs finish; MapDb is only touched here.
+        for r in rx {
+            done += 1;
+            let ImageJob { mapfile, revision, pathing } = r.job;
+            let file = store.cached_file(revision).and_then(|data| {
+                let file = Ffna::parse(&data).ok()?;
+                Some((file.file_type == TYPE_MAP, gw_nav::zones::zone_chunk(&file).ok()))
+            });
+            let mut notes = Vec::new();
+            if r.missing > 0 {
+                notes.push(format!("{} files missing", r.missing));
+            }
+            if r.render_failed {
+                notes.push("render failed".to_owned());
+            }
+            let status = match &r.result {
+                Ok(()) => {
+                    let what = if pathing { "pathing + render" } else { "render" };
+                    format!("{what}{}", notes.iter().map(|n| format!(", {n}")).collect::<String>())
+                }
+                Err(e) => {
+                    failed += 1;
+                    format!("FAILED: {e:#}")
+                }
+            };
+            println!("[{done:>4}/{total}] {}: {status} ({:.1?})", label(mapfile, revision), r.elapsed);
+            match file {
+                // Not a map after all; leave it out next time.
+                Some((false, _)) => db.set_is_map(mapfile, false)?,
+                Some((true, Some(chunk))) => {
+                    let defs: Vec<(u32, &str)> = chunk.defs.iter().map(|d| (d.id, d.ini_path.as_str())).collect();
+                    db.record_zone_defs(mapfile, revision, &defs)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })?;
+    println!("imaged {} of {total} map files in {:.1?}", done - failed, started.elapsed());
+    anyhow::ensure!(failed == 0, "{failed} map files failed");
+    Ok(())
+}
+
+fn scan_zones(db_path: &Path, cache_dir: &Path, cached_only: bool) -> Result<()> {
+    let mut store = PathingStore::new(cache_dir);
+    store.manifest(&mut print_progress)?;
+    record_store_manifest(db_path, &store);
+    let (_, manifest) = store.loaded_manifest().context("no asset manifest loaded")?;
+    let mut db = MapDb::open(db_path)?;
+    let files: Vec<(u32, u32)> = known_mapfiles(&db)?.into_iter().map(|f| (f, manifest.resolve(f))).collect();
+
+    let (mut changed, mut unchanged, mut skipped, mut failed) = (0, 0, 0, 0);
+    for (i, &(mapfile, revision)) in files.iter().enumerate() {
+        eprint!("\rscanning {}/{}", i + 1, files.len());
+        let _ = std::io::stderr().flush();
+        let data = if cached_only {
+            match store.cached_file(revision) {
+                Some(data) => data,
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            }
+        } else {
+            match store.map_file(revision) {
+                Ok(data) => data,
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("\n{mapfile} (revision {revision}): {e}");
+                    continue;
+                }
+            }
+        };
+        let chunk = Ffna::parse(&data).map_err(anyhow::Error::from).and_then(|file| {
+            anyhow::ensure!(file.file_type == TYPE_MAP, "not a map file");
+            Ok(gw_nav::zones::zone_chunk(&file)?)
+        });
+        match chunk {
+            Ok(chunk) => {
+                let defs: Vec<(u32, &str)> = chunk.defs.iter().map(|d| (d.id, d.ini_path.as_str())).collect();
+                if db.record_zone_defs(mapfile, revision, &defs)? {
+                    changed += 1;
+                } else {
+                    unchanged += 1;
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("\n{mapfile} (revision {revision}): {e}");
+            }
+        }
+    }
+    eprintln!();
+    println!(
+        "{} map files: {changed} recorded or updated, {unchanged} unchanged, {skipped} not cached, {failed} failed",
+        files.len()
+    );
+    Ok(())
+}
+
+fn print_zone_chunk(path: &Path, vertices: bool) -> Result<()> {
+    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let file = Ffna::parse(&data)?;
+    let chunk = file.chunk(0x1000_0003).context("no stage-1 zones chunk (0x10000003)")?;
+    let refs = match file.chunk(0x1100_0003) {
+        Some(refs) => parse_file_refs(refs)?,
+        None => Vec::new(),
+    };
+    let zones = ZonesStrip::parse(chunk)?;
+    let file_id = |i: usize| refs.get(i).map_or("?".into(), |id| id.to_string());
+
+    println!("zones chunk: {} bytes, version {}, {} file refs", chunk.len(), zones.version, refs.len());
+    for s in &zones.sections {
+        let name = match s.tag {
+            zones::tag::DEFS => "zone defs",
+            zones::tag::PROP_FILES => "prop files",
+            zones::tag::ZONES => "zones",
+            0xFF => "end",
+            _ => "unknown",
+        };
+        println!("  @{:#06x}  tag {:#04x}  {:>6} bytes  {name}", s.offset, s.tag, s.len);
+    }
+
+    let starts = zones.model_starts();
+    if starts.last() != Some(&refs.len()) {
+        println!("warning: the defs have {} models but the file-ref list has {}", starts.last().unwrap(), refs.len());
+    }
+    println!("\nzone defs: {}", zones.defs.len());
+    for (def, &start) in zones.defs.iter().zip(&starts) {
+        let used = zones.zones.iter().filter(|z| z.def_id == def.id).count();
+        println!(
+            "def {}  {}  ({} layers, {} models from ref {start}, used by {used} zones)",
+            def.id,
+            def.ini_path,
+            def.layers.len(),
+            def.models.len(),
+        );
+        let mut index = start;
+        for (i, (layer, models)) in def.layer_models().enumerate() {
+            println!(
+                "  layer {i}: kind {}  level {}  spacing {}  collision {}  density {}  scale variance {}  pattern {}  {} models",
+                layer.kind,
+                layer.level(),
+                layer.spacing,
+                layer.collision_radius,
+                layer.density,
+                layer.scale_variance,
+                layer.pattern,
+                layer.model_count,
+            );
+            let mut previous = 0.0;
+            for model in models {
+                println!(
+                    "    ref {index:>3}  file {:>7}  p {:.3}  (cumulative {:.3})  flags {:#06x}",
+                    file_id(index),
+                    model.cumulative_probability - previous,
+                    model.cumulative_probability,
+                    model.flags,
+                );
+                previous = model.cumulative_probability;
+                index += 1;
+            }
+        }
+    }
+
+    if let Some(props) = &zones.prop_files {
+        // One atlas nibble per model, low nibble first.
+        let nibbles: Vec<u8> = props.atlas.iter().flat_map(|b| [b & 0xF, b >> 4]).collect();
+        println!("\nprop files: {} models", props.models.len());
+        for (k, &i) in props.models.iter().enumerate() {
+            let atlas = nibbles.get(k).map_or("?".into(), |n| format!("{n:#x}"));
+            println!("  ref {i:>3}  file {:>7}  atlas {atlas}", file_id(i as usize));
+        }
+        let hex: Vec<_> = props.atlas.iter().map(|b| format!("{b:02x}")).collect();
+        println!("  atlas bytes: {}", hex.join(" "));
+    }
+
+    println!("\nzones: {}", zones.zones.len());
+    for (i, zone) in zones.zones.iter().enumerate() {
+        let area = zone.signed_area();
+        let bounds = zone
+            .bounds()
+            .map_or("-".into(), |(lo, hi)| format!("x {:.0}..{:.0}, y {:.0}..{:.0}", lo[0], hi[0], lo[1], hi[1]));
+        println!(
+            "zone {i:>3}  def {}  flags {:#04x}  height {} ({:#06x})  {} vertices  area {:.0} {}  {bounds}",
+            zone.def_id,
+            zone.flags,
+            zone.height(),
+            zone.height_raw,
+            zone.vertices.len(),
+            area.abs(),
+            if area < 0.0 { "cw" } else { "ccw" },
+        );
+        if vertices {
+            let points: Vec<_> = zone.vertices.iter().map(|p| format!("({:.1}, {:.1})", p[0], p[1])).collect();
+            for line in points.chunks(6) {
+                println!("      {}", line.join(" "));
+            }
+        }
+    }
+
+    for (tag, payload) in &zones.unknown {
+        let hex: String = payload.iter().take(64).map(|b| format!("{b:02x}")).collect();
+        println!("\nunknown tag {tag:#04x}, {} bytes: {hex}", payload.len());
     }
     Ok(())
 }

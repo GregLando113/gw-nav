@@ -16,6 +16,7 @@ pub mod path;
 pub mod props;
 pub mod tags;
 pub mod terrain;
+pub mod zones;
 #[cfg(test)]
 pub(crate) mod testdata;
 

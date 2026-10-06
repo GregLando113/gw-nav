@@ -3,15 +3,18 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::fileconn::{AssetManifest, FileClient, FileConnError};
+use crate::fileconn::{AssetManifest, ConnectionPool, FileConnError};
 use crate::mapfile::MapFileError;
 use crate::pathgen::chunk::MapInputs;
 use crate::render::{self, RENDER_VERSION, RenderError};
 
 use super::{FORMAT_VERSION, PathingData};
 
-/// Connections used to download a map's models and textures.
+/// Connections used to download a map's models and textures, and the size
+/// of a store's own connection pool.
 const MODEL_CONNECTIONS: usize = 4;
 /// Times a download is retried on a fresh connection after an I/O error.
 const RETRIES: usize = 2;
@@ -54,11 +57,15 @@ pub enum Progress {
 type Files = HashMap<u32, Vec<u8>>;
 
 /// Cached, lazily connecting source of pathing data.
+///
+/// Its fileserver connections come from a [`ConnectionPool`], which stores
+/// made with [`PathingStore::share`] use too, so several threads can load
+/// maps at once over a bounded number of connections.
 pub struct PathingStore {
     dir: PathBuf,
-    client: Option<FileClient>,
+    pool: Arc<ConnectionPool>,
     /// The asset manifest and its file id, once loaded.
-    manifest: Option<(u32, AssetManifest)>,
+    manifest: Option<Arc<(u32, AssetManifest)>>,
 }
 
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> PathingError + '_ {
@@ -66,8 +73,20 @@ fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> PathingError + '_ {
 }
 
 impl PathingStore {
+    /// A store with its own pool of [`MODEL_CONNECTIONS`] connections.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into(), client: None, manifest: None }
+        Self::with_pool(dir, Arc::new(ConnectionPool::fileserver(MODEL_CONNECTIONS)))
+    }
+
+    /// A store whose connections come from `pool`.
+    pub fn with_pool(dir: impl Into<PathBuf>, pool: Arc<ConnectionPool>) -> Self {
+        Self { dir: dir.into(), pool, manifest: None }
+    }
+
+    /// Another store on the same cache directory, sharing this one's
+    /// connection pool and (if loaded) asset manifest; for another thread.
+    pub fn share(&self) -> Self {
+        Self { dir: self.dir.clone(), pool: self.pool.clone(), manifest: self.manifest.clone() }
     }
 
     pub fn dir(&self) -> &Path {
@@ -97,6 +116,16 @@ impl PathingStore {
             })
             .max_by_key(|(modified, _, _)| *modified)
             .map(|(_, file_id, path)| (file_id, path))
+    }
+
+    /// Whether the pathing data of revision `file_id` of a map is cached.
+    pub fn has_pathing(&self, mapfile_id: u32, file_id: u32) -> bool {
+        self.pathing_path(mapfile_id, file_id).is_file()
+    }
+
+    /// Whether the render of revision `file_id` of a map is cached.
+    pub fn has_render(&self, mapfile_id: u32, file_id: u32) -> bool {
+        self.render_path(mapfile_id, file_id).is_file()
     }
 
     /// Cached pathing data, without touching the network.
@@ -169,8 +198,9 @@ impl PathingStore {
         Ok((file_id, self.bake_render(mapfile_id, file_id, &mut progress)?))
     }
 
-    /// Render revision `file_id` of a map and cache the image.
-    fn bake_render(&mut self, mapfile_id: u32, file_id: u32, progress: &mut impl FnMut(Progress)) -> Result<Vec<u8>> {
+    /// Render revision `file_id` of a map and cache the image, even if it
+    /// is cached already.
+    pub fn bake_render(&mut self, mapfile_id: u32, file_id: u32, progress: &mut impl FnMut(Progress)) -> Result<Vec<u8>> {
         let (map, files) = self.render_inputs(file_id, progress)?;
         progress(Progress::Rendering);
         let data = render::bake(&map, &files)?.encode()?;
@@ -250,29 +280,23 @@ impl PathingStore {
         Ok(inputs.bloat_path(&collision, &[]))
     }
 
-    fn client(&mut self, progress: &mut impl FnMut(Progress)) -> Result<&mut FileClient> {
-        if self.client.is_none() {
-            progress(Progress::Connecting);
-            self.client = Some(FileClient::connect()?);
-        }
-        Ok(self.client.as_mut().expect("connected above"))
-    }
-
     /// The current asset manifest, from the cache or the fileserver.
     pub fn manifest(&mut self, progress: &mut impl FnMut(Progress)) -> Result<&AssetManifest> {
         if self.manifest.is_none() {
-            let id = self.client(progress)?.asset_manifest_id();
+            let mut client = self.pool.get(|| progress(Progress::Connecting))?;
+            let id = client.asset_manifest_id();
             let path = self.dir.join(format!("manifest-{id}.bin"));
             let data = match std::fs::read(&path) {
                 Ok(data) => data,
                 Err(_) => {
                     progress(Progress::Manifest);
-                    let data = self.client(progress)?.download(id, |_, _| {})?;
+                    let data = client.download(id, |_, _| {})?;
                     write_atomic(&path, &data)?;
                     data
                 }
             };
-            self.manifest = Some((id, AssetManifest::parse(&data).map_err(FileConnError::from)?));
+            drop(client);
+            self.manifest = Some(Arc::new((id, AssetManifest::parse(&data).map_err(FileConnError::from)?)));
         }
         Ok(&self.manifest.as_ref().expect("loaded above").1)
     }
@@ -280,7 +304,7 @@ impl PathingStore {
     /// The asset manifest and its file id, if one was loaded; never
     /// connects.
     pub fn loaded_manifest(&self) -> Option<(u32, &AssetManifest)> {
-        self.manifest.as_ref().map(|(id, m)| (*id, m))
+        self.manifest.as_deref().map(|(id, m)| (*id, m))
     }
 
     fn file_path(&self, file_id: u32) -> PathBuf {
@@ -288,7 +312,7 @@ impl PathingStore {
     }
 
     /// Download `(base_id, file_id)` files over up to
-    /// [`MODEL_CONNECTIONS`] connections and cache them. Files missing from
+    /// [`MODEL_CONNECTIONS`] connections from the pool and cache them. Files missing from
     /// the fileserver are reported and skipped. A download that fails is
     /// retried on a new connection; if it keeps failing, it fails the whole
     /// call, or with `best_effort` is skipped like a missing file. `step`
@@ -305,12 +329,13 @@ impl PathingStore {
         let workers = MODEL_CONNECTIONS.min(queue.len());
         let queue = std::sync::Mutex::new(queue);
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut first = self.client.take();
+        let pool = &*self.pool;
         std::thread::scope(|scope| -> Result<()> {
             for _ in 0..workers {
-                let (tx, queue, client) = (tx.clone(), &queue, first.take());
+                let (tx, queue) = (tx.clone(), &queue);
                 scope.spawn(move || {
-                    let mut client = match client.map_or_else(FileClient::connect, Ok) {
+                    // Holds the connection until the queue is empty.
+                    let mut client = match pool.get(|| {}) {
                         Ok(client) => client,
                         Err(e) => return tx.send(Err((e, 0))).unwrap_or(()),
                     };
@@ -322,9 +347,8 @@ impl PathingStore {
                                 Err(FileConnError::NotFound(id)) => break Err((FileConnError::NotFound(id), file_id)),
                                 Err(e) if attempt < RETRIES => {
                                     attempt += 1;
-                                    match FileClient::connect() {
-                                        Ok(c) => client = c,
-                                        Err(_) => break Err((e, file_id)),
+                                    if client.reconnect().is_err() {
+                                        break Err((e, file_id));
                                     }
                                 }
                                 result => break result.map(|data| (base_id, file_id, data)).map_err(|e| (e, file_id)),
@@ -370,6 +394,11 @@ impl PathingStore {
         self.download(file_id, |_, _| {})
     }
 
+    /// A file by exact file id if it is in the cache; never connects.
+    pub fn cached_file(&self, file_id: u32) -> Option<Vec<u8>> {
+        std::fs::read(self.file_path(file_id)).ok()
+    }
+
     /// A decompressed file by exact file id, from the cache or the
     /// fileserver.
     fn download(&mut self, file_id: u32, progress: impl FnMut(u32, u32)) -> Result<Vec<u8>> {
@@ -377,19 +406,22 @@ impl PathingStore {
         if let Ok(data) = std::fs::read(&path) {
             return Ok(data);
         }
-        let data = self.client(&mut |_| {})?.download(file_id, progress)?;
+        let data = self.pool.get(|| {})?.download(file_id, progress)?;
         write_atomic(&path, &data)?;
         Ok(data)
     }
 }
 
 /// Write via a temporary file so an interrupted write leaves no truncated
-/// cache entry.
+/// cache entry. The temporary name is unique, as threads sharing a cache
+/// can write the same file (a model two maps use) at once.
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(io_err(dir))?;
     }
-    let tmp = path.with_extension("tmp");
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}-{n}.tmp", std::process::id()));
     std::fs::write(&tmp, data).map_err(io_err(&tmp))?;
     std::fs::rename(&tmp, path).map_err(io_err(path))
 }

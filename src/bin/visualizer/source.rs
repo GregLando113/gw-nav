@@ -283,7 +283,17 @@ mod local {
                     let file_id = data.file_id;
                     send(Event::Loaded(Box::new(data)));
                     let a = gw_nav::zones::annotations(&mut store, &db, zones_db.as_deref(), mapfile_id, file_id);
+                    // The map list shows the zone def paths of map files
+                    // loaded before.
+                    let recorded = a.zone_chunk.as_ref().map(|chunk| {
+                        gw_nav::zones::record_zone_paths(&db, mapfile_id, file_id, chunk)
+                    });
                     send(Event::Annotations(mapfile_id, Box::new(a)));
+                    match recorded {
+                        Some(Ok(true)) => send(Event::Maps(map_list(&db))),
+                        Some(Err(e)) => send(Event::Progress(format!("Recording zone def paths failed: {e}"), None)),
+                        _ => {}
+                    }
                     let image = store
                         .load_render(mapfile_id, false, progress)
                         .map_err(|e| e.to_string())

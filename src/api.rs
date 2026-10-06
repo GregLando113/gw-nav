@@ -1,15 +1,16 @@
 //! The relay server's HTTP API, shared by the server (`gw-nav-relay` binary) and
 //! its clients (the visualizer, including the web build).
 //!
-//! - `GET /api/maps`: the MapDb rows as a JSON array of [`MapEntry`].
+//! - `GET /api/maps`: the MapDb rows as a JSON array of [`MapEntry`], with
+//!   the zone def paths recorded for their map files.
 //! - `GET /api/pathing/<mapfile_id>`: the map's stage-2 path chunk
 //!   (`0x20000008` payload, `application/octet-stream`), from the relay's
 //!   cache or downloaded and generated on demand. The revision it was
 //!   generated from is in the [`FILE_ID_HEADER`] header. `?refresh=1`
 //!   regenerates it from the current revision.
 //! - `GET /api/annotations/<mapfile_id>`: [`MapAnnotations`] as JSON: the
-//!   map file's mission points and portal props, and the zone exits recorded
-//!   for its maps.
+//!   map file's mission points, portal props and Zones chunk, and the zone
+//!   exits recorded for its maps.
 //! - `GET /api/render/<mapfile_id>`: the map's baked top-down render (a
 //!   [`crate::render::WorldRender`] file), from the cache or rendered on
 //!   demand, for the revision of the cached pathing data. The revision is
@@ -20,6 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::mapfile::mission::MissionPoint;
+use crate::mapfile::zones::{Zone, ZoneDef};
 
 pub const MAPS_PATH: &str = "/api/maps";
 pub const PATHING_PATH: &str = "/api/pathing/";
@@ -37,6 +39,10 @@ pub struct MapEntry {
     pub mapid: Option<u32>,
     pub name: Option<String>,
     pub mapfile: Option<u32>,
+    /// The distinct zone def `.ini` paths recorded for the map file (empty
+    /// until the map file has been loaded or scanned).
+    #[serde(default)]
+    pub zone_paths: Vec<String>,
 }
 
 /// A zone transition recorded in game (gwbs `zones.db`): walking into
@@ -68,6 +74,31 @@ pub struct PortalProp {
     pub yaw: u8,
 }
 
+/// The map file's Zones chunk (stage 1): the procedurally populated areas
+/// (grass, trees, rocks) and the defs they are populated from.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ZoneChunk {
+    pub defs: Vec<ZoneDef>,
+    pub zones: Vec<Zone>,
+    /// The zones file-reference list (`0x11000003`): the defs' models in
+    /// order, def by def.
+    pub model_files: Vec<u32>,
+}
+
+impl ZoneChunk {
+    /// The index in [`Self::model_files`] of each def's first model.
+    pub fn model_starts(&self) -> Vec<usize> {
+        self.defs
+            .iter()
+            .scan(0, |next, def| {
+                let start = *next;
+                *next += def.models.len();
+                Some(start)
+            })
+            .collect()
+    }
+}
+
 /// Points of interest on a map file, beside its pathing data.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MapAnnotations {
@@ -75,6 +106,8 @@ pub struct MapAnnotations {
     pub zone_exits: Vec<ZoneExit>,
     #[serde(default)]
     pub portal_props: Vec<PortalProp>,
+    #[serde(default)]
+    pub zone_chunk: Option<ZoneChunk>,
     /// Map ids that use the map file (from MapDb).
     pub map_ids: Vec<u32>,
     /// Why some of it is missing, if it is.
@@ -152,6 +185,11 @@ mod tests {
         assert_eq!(parse_annotations_request("/api/annotations/"), None);
         let a = MapAnnotations {
             zone_exits: vec![ZoneExit { from_map: 1, to_map: None, x: 1.0, y: 2.0, plane: 0, hits: 3, dir: Some([0.0, 1.0]) }],
+            zone_chunk: Some(ZoneChunk {
+                defs: vec![ZoneDef { id: 2, ini_path: "A\\Zones\\B.ini".into(), layers: vec![], models: vec![] }],
+                zones: vec![Zone { def_id: 2, flags: 6, height_raw: 0x8000, vertices: vec![[1.0, 2.0], [3.0, 4.0]] }],
+                model_files: vec![11830],
+            }),
             ..Default::default()
         };
         assert_eq!(serde_json::from_str::<MapAnnotations>(&serde_json::to_string(&a).unwrap()).unwrap(), a);
@@ -160,11 +198,19 @@ mod tests {
     #[test]
     fn map_entry_json() {
         for e in [
-            MapEntry { mapid: Some(546), name: Some("Jaga Moraine".into()), mapfile: Some(290943) },
-            MapEntry { mapid: None, name: None, mapfile: Some(13989) },
+            MapEntry {
+                mapid: Some(546),
+                name: Some("Jaga Moraine".into()),
+                mapfile: Some(290943),
+                zone_paths: vec!["Chapter4\\Missions\\Mountain\\Ridge\\Zones\\MountainRidgeSnow.ini".into()],
+            },
+            MapEntry { mapid: None, name: None, mapfile: Some(13989), zone_paths: vec![] },
         ] {
             let json = serde_json::to_string(&e).unwrap();
             assert_eq!(serde_json::from_str::<MapEntry>(&json).unwrap(), e);
         }
+        // Lists from relays without zone paths.
+        let old: MapEntry = serde_json::from_str(r#"{"mapid":1,"name":null,"mapfile":2}"#).unwrap();
+        assert!(old.zone_paths.is_empty());
     }
 }
