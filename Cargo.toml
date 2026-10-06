@@ -1,0 +1,45 @@
+[package]
+name = "gw-nav"
+version = "0.1.0"
+edition = "2024"
+default-run = "gw-nav"
+
+[features]
+default = ["gui"]
+# The visualizer's GUI stack. Build without it for headless environments:
+# `cargo build --release --bin gw-nav-relay --no-default-features`.
+gui = ["dep:arboard", "dep:bytemuck", "dep:eframe", "dep:egui_extras", "dep:ehttp", "dep:rfd"]
+
+[[bin]]
+name = "gw-nav"
+path = "src/bin/visualizer/main.rs"
+required-features = ["gui"]
+
+[dependencies]
+anyhow = "1.0.104"
+bytemuck = { version = "1", optional = true }
+eframe = { version = "0.36.2", optional = true, features = ["persistence"] }
+egui_extras = { version = "0.36.2", optional = true }
+ehttp = { version = "0.7.1", optional = true }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0.21"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Reading the clipboard on demand (the same version egui-winit uses).
+arboard = { version = "3.6", default-features = false, optional = true }
+clap = { version = "4.6.7", features = ["derive"] }
+# File dialogs (picking a MapDb to import).
+rfd = { version = "0.17.2", optional = true }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tiny_http = "0.12.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Document", "Window", "HtmlCanvasElement", "Location", "Navigator", "Clipboard", "console"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
