@@ -311,6 +311,9 @@ pub struct App {
     hovered_prop: Option<usize>,
     /// The row under the pointer in the Zones list, highlighted on the map.
     zone_list_hover: ListHover,
+    /// The Maps row whose context menu edits its association, and the id
+    /// typed there.
+    association: Option<((Option<u32>, Option<u32>), String)>,
 }
 
 impl App {
@@ -352,6 +355,7 @@ impl App {
             map_rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(800.0)),
             hovered_prop: None,
             zone_list_hover: ListHover::default(),
+            association: None,
         }
     }
 
@@ -446,7 +450,7 @@ impl App {
             if ui.small_button("reload").clicked() {
                 self.source.request_maps();
             }
-            if self.source.can_import()
+            if self.source.can_edit()
                 && ui
                     .small_button("import…")
                     .on_hover_text("Merge map rows from another MapDb file. Rows with a mapfile replace ours.")
@@ -503,6 +507,11 @@ impl App {
             })
             .collect();
         let mut clicked = None;
+        let mut associate = None;
+        let editable = self.source.can_edit();
+        let loaded = self.map.as_ref().map(|m| m.data.mapfile_id);
+        let all = &self.zones;
+        let association = &mut self.association;
         TableBuilder::new(ui)
             .striped(true)
             .sense(Sense::click())
@@ -515,7 +524,10 @@ impl App {
                     ui.strong("mapid");
                 });
                 header.col(|ui| {
-                    ui.strong("mapfile");
+                    let response = ui.strong("mapfile");
+                    if editable {
+                        response.on_hover_text("Right-click a row to set its map file, or the map id of a map file");
+                    }
                 });
                 header.col(|ui| {
                     ui.strong("name");
@@ -555,11 +567,44 @@ impl App {
                             ui.weak(folder).on_hover_text(zone.zone_paths.join("\n"));
                         }
                     });
-                    if row.response().clicked() {
+                    let response = row.response();
+                    if response.clicked() {
                         clicked = Some((zone.mapid, zone.mapfile));
+                    }
+                    if editable {
+                        // Clicks in the menu's text field must not close it.
+                        egui::Popup::context_menu(&response)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show(|ui| {
+                                let key = (zone.mapid, zone.mapfile);
+                                if association.as_ref().is_none_or(|(k, _)| *k != key) {
+                                    // A map's own map file, else the loaded one.
+                                    let prefill = zone.mapid.and(zone.mapfile.or(loaded));
+                                    *association = Some((key, prefill.map(|f| f.to_string()).unwrap_or_default()));
+                                }
+                                let input = &mut association.as_mut().unwrap().1;
+                                if let Some(change) = association_menu(ui, zone, input, loaded, all) {
+                                    associate = Some((key, change));
+                                    ui.close();
+                                }
+                            });
                     }
                 });
             });
+        if let Some(((mapid, old_mapfile), (new_mapid, new_mapfile))) = associate {
+            self.association = None;
+            self.status = match self.source.set_mapfile(new_mapid, new_mapfile) {
+                Ok(()) => {
+                    let file = new_mapfile.map_or("no map file".into(), |f| format!("map file {f}"));
+                    format!("Map {new_mapid} now has {file}")
+                }
+                Err(e) => format!("Setting the map file of map {new_mapid} failed: {e}"),
+            };
+            if self.selected == Some((mapid, old_mapfile)) {
+                self.selected = Some((Some(new_mapid), new_mapfile));
+            }
+            self.source.request_maps();
+        }
         if let Some((mapid, mapfile)) = clicked {
             self.selected = Some((mapid, mapfile));
             match mapfile {
@@ -568,7 +613,10 @@ impl App {
                     self.source.load(id, false);
                 }
                 Some(_) => {}
-                None => self.status = format!("Map {} has no map file id", mapid.unwrap_or(0)),
+                None => {
+                    let hint = if self.source.can_edit() { " (right-click it to set one)" } else { "" };
+                    self.status = format!("Map {} has no map file id{hint}", mapid.unwrap_or(0));
+                }
             }
         }
     }
@@ -850,6 +898,77 @@ impl eframe::App for App {
         let default_pos = self.map_rect.right_top() + Vec2::new(-340.0, 40.0);
         self.waypointer.window(ui.ctx(), default_pos, self.map.as_ref().map(|m| &m.nav));
     }
+}
+
+/// The context menu of a Maps row: set a map's map file, or the map id of
+/// a map file no map names yet. `input` is the id typed, `loaded` the map
+/// file in the view. Returns the change, as `(mapid, mapfile)`.
+fn association_menu(
+    ui: &mut egui::Ui,
+    zone: &MapEntry,
+    input: &mut String,
+    loaded: Option<u32>,
+    zones: &[MapEntry],
+) -> Option<(u32, Option<u32>)> {
+    let typed = input.trim().parse::<u32>().ok();
+    let mut change = None;
+    let mut field = |ui: &mut egui::Ui, label: &str, apply: &str, ok: bool| {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            let edit = ui.add(egui::TextEdit::singleline(input).desired_width(80.0));
+            let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.add_enabled(ok, egui::Button::new(apply)).clicked() || (ok && entered)
+        })
+        .inner
+    };
+    match (zone.mapid, zone.mapfile) {
+        (Some(mapid), current) => {
+            ui.strong(format!("Map {mapid} {}", zone.name.as_deref().unwrap_or("")));
+            let ok = typed.is_some_and(|f| Some(f) != current);
+            if field(ui, "Map file id", "Set", ok) {
+                change = Some((mapid, typed));
+            }
+            if let Some(file) = typed {
+                let others: Vec<String> = zones
+                    .iter()
+                    .filter(|z| z.mapfile == Some(file))
+                    .filter_map(|z| z.mapid.filter(|&m| m != mapid).map(|m| m.to_string()))
+                    .collect();
+                if !others.is_empty() {
+                    ui.weak(format!("Also the map file of maps {}", others.join(", ")));
+                }
+            }
+            if let Some(file) = loaded.filter(|&f| Some(f) != current)
+                && ui.button(format!("Use the loaded map file ({file})")).clicked()
+            {
+                change = Some((mapid, Some(file)));
+            }
+            if current.is_some() && ui.button("Clear the map file").clicked() {
+                change = Some((mapid, None));
+            }
+        }
+        (None, Some(file)) => {
+            ui.strong(format!("Map file {file}"));
+            if field(ui, "Map id", "Assign", typed.is_some()) {
+                change = Some((typed.unwrap(), Some(file)));
+            }
+            if let Some(mapid) = typed {
+                match zones.iter().find(|z| z.mapid == Some(mapid)) {
+                    Some(z) => {
+                        ui.label(z.name.as_deref().unwrap_or("(no name)"));
+                        if let Some(old) = z.mapfile {
+                            ui.colored_label(Color32::YELLOW, format!("Replaces its map file {old}"));
+                        }
+                    }
+                    None => {
+                        ui.weak("No such map id yet; a row is added");
+                    }
+                }
+            }
+        }
+        (None, None) => {}
+    }
+    change
 }
 
 /// The Maps list's zones column: the most common folder among a map file's

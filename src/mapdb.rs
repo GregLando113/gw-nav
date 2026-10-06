@@ -148,6 +148,17 @@ impl MapDb {
         upsert_zone(&self.conn, zone)
     }
 
+    /// Set the mapfile of map `mapid` (`None` clears it), keeping the rest
+    /// of its row. A mapid without a row gets one with no name.
+    pub fn set_mapfile(&self, mapid: u32, mapfile: Option<u32>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO map_zones (mapid, mapfile) VALUES (?1, ?2)
+             ON CONFLICT(mapid) DO UPDATE SET mapfile = excluded.mapfile",
+            params![mapid, mapfile],
+        )?;
+        Ok(())
+    }
+
     /// Merge all rows from the `map_zones` table of another database.
     /// New mapids are always inserted. Incoming rows overwrite existing local
     /// rows only if they carry a mapfile (non-empty, non-zero). The merge runs
@@ -401,6 +412,17 @@ mod tests {
 
         let ids: Vec<u32> = db.all().unwrap().iter().map(|z| z.mapid).collect();
         assert_eq!(ids, vec![5, 109, 232]);
+    }
+
+    #[test]
+    fn set_mapfile_keeps_row() {
+        let db = sample_db();
+        db.set_mapfile(109, Some(500)).unwrap();
+        assert_eq!(db.get(109).unwrap(), Some(zone(109, "The Amnoon Oasis", 500)));
+        db.set_mapfile(109, None).unwrap();
+        assert_eq!(db.get(109).unwrap().unwrap().mapfile, None);
+        db.set_mapfile(7, Some(600)).unwrap();
+        assert_eq!(db.get(7).unwrap(), Some(MapZone { mapid: 7, name: None, mapfile: Some(600), unknown: None }));
     }
 
     #[test]

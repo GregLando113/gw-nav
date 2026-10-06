@@ -76,9 +76,10 @@ impl Source {
         self.ctx.request_repaint();
     }
 
-    /// Whether map rows can be imported from another MapDb (local data
-    /// only; the relay has no import).
-    pub fn can_import(&self) -> bool {
+    /// Whether MapDb can be changed: rows imported from another MapDb or
+    /// map files associated with map ids (local data only; the relay is
+    /// read-only).
+    pub fn can_edit(&self) -> bool {
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             Backend::Local { .. } => true,
@@ -117,6 +118,19 @@ impl Source {
                 Some((other.display().to_string(), summary))
             }
             Backend::Relay { .. } => None,
+        }
+    }
+
+    /// Associate map file `mapfile` with map `mapid` in MapDb (`None`
+    /// clears it). The map list needs requesting again afterwards.
+    #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+    pub fn set_mapfile(&self, mapid: u32, mapfile: Option<u32>) -> Result<(), String> {
+        match &self.backend {
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Local { db, .. } => {
+                gw_nav::MapDb::open(db).and_then(|db| db.set_mapfile(mapid, mapfile)).map_err(|e| e.to_string())
+            }
+            Backend::Relay { .. } => Err("the relay's map list is read-only".into()),
         }
     }
 
