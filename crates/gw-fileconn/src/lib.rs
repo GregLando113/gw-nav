@@ -1,11 +1,16 @@
 //! FileConn: download files from the Guild Wars fileserver.
+//!
+//! [`FileClient`] speaks the fileserver protocol (see
+//! `docs/fileserver-protocol.md`), [`decompress`] unpacks the downloaded
+//! files, [`AssetManifest`] maps base file ids to their current revisions, and
+//! [`ConnectionPool`] shares connections between threads.
 
 mod client;
 pub mod decompress;
 pub mod manifest;
 pub mod pool;
 
-pub use client::{FILESERVER_PORT, FileClient, RawFile};
+pub use client::{FILESERVER_FALLBACK_PORT, FILESERVER_PORT, Fetch, FileClient, RawFile};
 pub use decompress::{DecompressError, decompress};
 pub use manifest::{AssetManifest, ManifestEntry, ManifestError, MapFileCandidate};
 pub use pool::{ConnectionPool, Pool, Pooled};
@@ -18,9 +23,11 @@ pub enum FileConnError {
     NoServer(String),
     #[error("file {0} not found on the fileserver")]
     NotFound(u32),
-    #[error("unexpected packet stage={stage:#04x} action={action} (expected {expected})")]
+    #[error("the fileserver cancelled the request for file {0}")]
+    Cancelled(u32),
+    #[error("unexpected packet seq={seq:#04x} action={action} (expected {expected})")]
     UnexpectedPacket {
-        stage: u8,
+        seq: u8,
         action: u8,
         expected: &'static str,
     },

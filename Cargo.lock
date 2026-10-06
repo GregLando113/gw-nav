@@ -1564,6 +1564,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gw-fileconn"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "gw-nav"
 version = "0.1.0"
 dependencies = [
@@ -1574,6 +1581,7 @@ dependencies = [
  "eframe",
  "egui_extras",
  "ehttp",
+ "gw-fileconn",
  "image",
  "indicatif",
  "js-sys",

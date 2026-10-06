@@ -583,7 +583,7 @@ mod tests {
     /// `cargo run -- download <ids> --raw --out-dir testdata`.
     #[test]
     fn golden_files() {
-        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata"));
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata"));
         let Ok(entries) = std::fs::read_dir(dir) else {
             eprintln!("skipping: {} not found", dir.display());
             return;

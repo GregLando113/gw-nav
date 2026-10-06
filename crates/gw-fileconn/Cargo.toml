@@ -1,0 +1,8 @@
+[package]
+name = "gw-fileconn"
+version = "0.1.0"
+edition = "2024"
+description = "Client for the Guild Wars fileserver: download, decompress, asset manifest."
+
+[dependencies]
+thiserror = "2.0.21"

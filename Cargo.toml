@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/gw-fileconn"]
+
 [package]
 name = "gw-nav"
 version = "0.1.0"
@@ -30,6 +33,7 @@ thiserror = "2.0.21"
 # Reading the clipboard on demand (the same version egui-winit uses).
 arboard = { version = "3.6", default-features = false, optional = true }
 clap = { version = "4.6.7", features = ["derive"] }
+gw-fileconn = { path = "crates/gw-fileconn" }
 # The CLI's download progress bars.
 indicatif = "0.18.6"
 # File dialogs (picking a MapDb to import).

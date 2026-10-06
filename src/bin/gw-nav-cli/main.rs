@@ -11,7 +11,7 @@ use gw_nav::mapfile::ffna::TYPE_MAP;
 use gw_nav::mapfile::zones::{self, ZonesStrip};
 use gw_nav::mapfile::{ChunkId, Ffna, parse_file_refs};
 use gw_nav::pathing::Progress;
-use gw_nav::fileconn::ConnectionPool;
+use gw_nav::fileconn::{ConnectionPool, Fetch, RawFile};
 use gw_nav::{AssetManifest, FileClient, MapDb, MapZone, PathingStore};
 use progress::{Board, Line};
 
@@ -143,8 +143,9 @@ enum Command {
         /// Map files processed at once.
         #[arg(long, default_value_t = 4)]
         jobs: usize,
-        /// Fileserver connections shared by all jobs.
-        #[arg(long, default_value_t = 8)]
+        /// Fileserver connections shared by all jobs. A job downloads over
+        /// one connection at a time, with its requests pipelined.
+        #[arg(long, default_value_t = 2)]
         connections: usize,
         /// Process at most this many map files.
         #[arg(long)]
@@ -288,46 +289,77 @@ fn download(file_ids: &[u32], out_dir: &Path, save_raw: bool, cache_dir: Option<
     let mut client = FileClient::connect()?;
     let manifest = cache_dir.map(|dir| asset_manifest(&mut client, dir)).transpose()?;
     let board = Board::with_total(file_ids.len());
-    let mut line = board.line();
+    // The ids asked for, by the revision downloaded for them.
+    let mut requested: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut revisions = Vec::new();
     for &id in file_ids {
         let current = manifest.as_ref().map_or(id, |m| m.resolve(id));
         if current != id {
             board.println(format!("{id}: current revision is {current}"));
         }
-        line.start(if current == id { id.to_string() } else { format!("{id} (r{current})") });
-        let raw = client.download_raw(current, |done, total| {
-            line.progress(Progress::Bytes { file_id: current, done, total })
-        });
-        board.inc(1);
-        let raw = match raw {
-            Ok(raw) => raw,
-            Err(gw_nav::FileConnError::NotFound(_)) => {
-                board.eprintln(format!("{id}: not found on fileserver"));
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        board.println(format!(
-            "{id}: compressed {} bytes, decompressed {} bytes, crc {:#010x}",
-            raw.size_compressed, raw.size_decompressed, raw.crc
-        ));
-        if save_raw {
-            let path = out_dir.join(format!("{id}.cmp"));
-            std::fs::write(&path, &raw.data).with_context(|| format!("writing {}", path.display()))?;
-        }
-        let blob = raw
-            .decompress()
-            .with_context(|| format!("decompressing file {id}"))?;
-        let path = out_dir.join(format!("{id}.mapblob"));
-        std::fs::write(&path, &blob).with_context(|| format!("writing {}", path.display()))?;
-        let magic = blob.get(..4).map(|m| String::from_utf8_lossy(m).into_owned());
-        board.println(format!(
-            "{id}: saved {} (magic {:?}, type {:?})",
-            path.display(),
-            magic.unwrap_or_default(),
-            blob.get(4)
-        ));
+        requested.entry(current).or_default().push(id);
+        revisions.push(current);
     }
+    let mut line = board.line();
+    let mut shown = None;
+    let mut error = None;
+    client.download_many(&revisions, |event| match event {
+        Fetch::Bytes { file_id, done, total } => {
+            if shown != Some(file_id) {
+                shown = Some(file_id);
+                let id = requested.get(&file_id).map_or(file_id, |ids| ids[0]);
+                line.start(if file_id == id { id.to_string() } else { format!("{id} (r{file_id})") });
+            }
+            line.progress(Progress::Bytes { file_id, done, total });
+        }
+        Fetch::Done { file_id, result } => {
+            for id in requested.remove(&file_id).unwrap_or_default() {
+                board.inc(1);
+                if error.is_none() {
+                    error = save_download(id, &result, out_dir, save_raw, &board).err();
+                }
+            }
+        }
+    })?;
+    error.map_or(Ok(()), Err)
+}
+
+/// Save a file [`download`] fetched for `id`, or report it missing.
+fn save_download(
+    id: u32,
+    raw: &Result<RawFile, gw_nav::FileConnError>,
+    out_dir: &Path,
+    save_raw: bool,
+    board: &Board,
+) -> Result<()> {
+    let raw = match raw {
+        Ok(raw) => raw,
+        Err(gw_nav::FileConnError::NotFound(_)) => {
+            board.eprintln(format!("{id}: not found on fileserver"));
+            return Ok(());
+        }
+        Err(e) => anyhow::bail!("downloading file {id}: {e}"),
+    };
+    board.println(format!(
+        "{id}: compressed {} bytes, decompressed {} bytes, crc {:#010x}",
+        raw.size_compressed, raw.size_decompressed, raw.crc
+    ));
+    if save_raw {
+        let path = out_dir.join(format!("{id}.cmp"));
+        std::fs::write(&path, &raw.data).with_context(|| format!("writing {}", path.display()))?;
+    }
+    let blob = raw
+        .decompress()
+        .with_context(|| format!("decompressing file {id}"))?;
+    let path = out_dir.join(format!("{id}.mapblob"));
+    std::fs::write(&path, &blob).with_context(|| format!("writing {}", path.display()))?;
+    let magic = blob.get(..4).map(|m| String::from_utf8_lossy(m).into_owned());
+    board.println(format!(
+        "{id}: saved {} (magic {:?}, type {:?})",
+        path.display(),
+        magic.unwrap_or_default(),
+        blob.get(4)
+    ));
     Ok(())
 }
 
@@ -346,27 +378,52 @@ fn fetch_models(mapfile_id: u32, out_dir: &Path, cache_dir: &Path, db: &Path) ->
     let map = Ffna::parse(&map)?;
     let refs = map.chunk(0x1100_0004).context("map has no prop file references")?;
     let ids = gw_nav::mapfile::parse_file_refs(refs)?;
-    let mut fetched = 0;
     let board = Board::with_total(ids.len());
-    let mut line = board.line();
-    for id in &ids {
-        board.inc(1);
-        let path = out_dir.join(format!("{id}.ffna"));
-        if path.exists() {
+    // Models not saved yet, by the revision downloaded for them.
+    let mut wanted: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut revisions = Vec::new();
+    for &id in &ids {
+        let file_id = manifest.resolve(id);
+        let bases = wanted.entry(file_id).or_default();
+        if bases.contains(&id) || out_dir.join(format!("{id}.ffna")).exists() {
+            board.inc(1);
             continue;
         }
-        let file_id = manifest.resolve(*id);
-        line.start(format!("model {id}"));
-        match client.download(file_id, |done, total| line.progress(Progress::Bytes { file_id, done, total })) {
-            Ok(data) => {
-                std::fs::write(&path, data)?;
-                fetched += 1;
-            }
-            Err(gw_nav::FileConnError::NotFound(_)) => board.eprintln(format!("{id}: not found")),
-            Err(e) => return Err(e.into()),
-        }
+        bases.push(id);
+        revisions.push(file_id);
     }
+    let mut line = board.line();
+    let (mut shown, mut fetched, mut error) = (None, 0, None);
+    client.download_many(&revisions, |event| match event {
+        Fetch::Bytes { file_id, done, total } => {
+            if shown != Some(file_id) {
+                shown = Some(file_id);
+                let id = wanted.get(&file_id).map_or(file_id, |ids| ids[0]);
+                line.start(format!("model {id}"));
+            }
+            line.progress(Progress::Bytes { file_id, done, total });
+        }
+        Fetch::Done { file_id, result } => {
+            let data = result.and_then(|raw| raw.decompress().map_err(Into::into));
+            for id in wanted.remove(&file_id).unwrap_or_default() {
+                board.inc(1);
+                match &data {
+                    Ok(data) => match std::fs::write(out_dir.join(format!("{id}.ffna")), data) {
+                        Ok(()) => fetched += 1,
+                        Err(e) => {
+                            error.get_or_insert(anyhow::Error::from(e).context(format!("writing model {id}")));
+                        }
+                    },
+                    Err(gw_nav::FileConnError::NotFound(_)) => board.eprintln(format!("{id}: not found")),
+                    Err(e) => {
+                        error.get_or_insert(anyhow::anyhow!("model {id}: {e}"));
+                    }
+                }
+            }
+        }
+    })?;
     drop((line, board));
+    error.map_or(Ok(()), Err)?;
     println!("{} model refs, {fetched} downloaded", ids.len());
     Ok(())
 }

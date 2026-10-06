@@ -6,18 +6,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::fileconn::{AssetManifest, ConnectionPool, FileConnError};
+use crate::fileconn::{AssetManifest, ConnectionPool, Fetch, FileConnError};
 use crate::mapfile::MapFileError;
 use crate::pathgen::chunk::MapInputs;
 use crate::render::{self, RENDER_VERSION, RenderError};
 
 use super::{FORMAT_VERSION, PathingData};
 
-/// Connections used to download a map's models and textures, and the size
-/// of a store's own connection pool.
-const MODEL_CONNECTIONS: usize = 4;
-/// Times a download is retried on a fresh connection after an I/O error.
-const RETRIES: usize = 2;
+/// The size of a store's own connection pool. A download takes one
+/// connection and pipelines its files over it, as the game client does.
+const STORE_CONNECTIONS: usize = 1;
 
 #[derive(thiserror::Error, Debug)]
 pub enum PathingError {
@@ -61,14 +59,6 @@ pub enum Progress {
 /// Downloaded files by base file id.
 type Files = HashMap<u32, Vec<u8>>;
 
-/// What a [`PathingStore::download_files`] worker reports: a download's
-/// [`Progress::Bytes`], or its `(base_id, file_id, data)` or error (and the
-/// file id, 0 if the worker could not connect).
-enum Fetched {
-    Bytes(Progress),
-    Done(std::result::Result<(u32, u32, Vec<u8>), (FileConnError, u32)>),
-}
-
 /// Cached, lazily connecting source of pathing data.
 ///
 /// Its fileserver connections come from a [`ConnectionPool`], which stores
@@ -86,9 +76,9 @@ fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> PathingError + '_ {
 }
 
 impl PathingStore {
-    /// A store with its own pool of [`MODEL_CONNECTIONS`] connections.
+    /// A store with its own pool of [`STORE_CONNECTIONS`] connections.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self::with_pool(dir, Arc::new(ConnectionPool::fileserver(MODEL_CONNECTIONS)))
+        Self::with_pool(dir, Arc::new(ConnectionPool::fileserver(STORE_CONNECTIONS)))
     }
 
     /// A store whose connections come from `pool`.
@@ -324,12 +314,12 @@ impl PathingStore {
         self.dir.join("files").join(format!("{file_id}.bin"))
     }
 
-    /// Download `(base_id, file_id)` files over up to
-    /// [`MODEL_CONNECTIONS`] connections from the pool and cache them. Files missing from
-    /// the fileserver are reported and skipped. A download that fails is
-    /// retried on a new connection; if it keeps failing, it fails the whole
-    /// call, or with `best_effort` is skipped like a missing file. `step`
-    /// reports the count.
+    /// Download `(base_id, file_id)` files over one pipelined connection
+    /// from the pool and cache them. Files missing from the fileserver are
+    /// reported and skipped. If the connection keeps failing or a file does
+    /// not decompress, the whole call fails, or with `best_effort` the files
+    /// not downloaded are skipped like missing ones. `step` reports the
+    /// count.
     fn download_files(
         &mut self,
         queue: Vec<(u32, u32)>,
@@ -339,76 +329,60 @@ impl PathingStore {
         step: fn(usize, usize) -> Progress,
         best_effort: bool,
     ) -> Result<()> {
-        let workers = MODEL_CONNECTIONS.min(queue.len());
-        let queue = std::sync::Mutex::new(queue);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let pool = &*self.pool;
-        std::thread::scope(|scope| -> Result<()> {
-            for _ in 0..workers {
-                let (tx, queue) = (tx.clone(), &queue);
-                scope.spawn(move || {
-                    // Holds the connection until the queue is empty.
-                    let mut client = match pool.get(|| {}) {
-                        Ok(client) => client,
-                        Err(e) => return tx.send(Fetched::Done(Err((e, 0)))).unwrap_or(()),
-                    };
-                    loop {
-                        let Some((base_id, file_id)) = queue.lock().expect("queue").pop() else { break };
-                        let mut attempt = 0;
-                        let result = loop {
-                            let bytes = |done, total| {
-                                let _ = tx.send(Fetched::Bytes(Progress::Bytes { file_id, done, total }));
-                            };
-                            match client.download(file_id, bytes) {
-                                Err(FileConnError::NotFound(id)) => break Err((FileConnError::NotFound(id), file_id)),
-                                Err(e) if attempt < RETRIES => {
-                                    attempt += 1;
-                                    if client.reconnect().is_err() {
-                                        break Err((e, file_id));
-                                    }
-                                }
-                                result => break result.map(|data| (base_id, file_id, data)).map_err(|e| (e, file_id)),
-                            }
-                        };
-                        if tx.send(Fetched::Done(result)).is_err() {
-                            break;
-                        }
+        // Base ids by file id, until the file is done.
+        let mut pending: HashMap<u32, Vec<u32>> = HashMap::new();
+        for &(base_id, file_id) in &queue {
+            pending.entry(file_id).or_default().push(base_id);
+        }
+        let file_ids: Vec<u32> = queue.iter().map(|&(_, file_id)| file_id).collect();
+        let mut missing = 0;
+        let mut error = None;
+        let mut client = self.pool.get(|| {})?;
+        let result = client.download_many(&file_ids, |event| {
+            let (file_id, result) = match event {
+                Fetch::Bytes { file_id, done, total } => return progress(Progress::Bytes { file_id, done, total }),
+                Fetch::Done { file_id, result } => (file_id, result),
+            };
+            let base_ids = pending.remove(&file_id).unwrap_or_default();
+            match result.and_then(|raw| raw.decompress().map_err(FileConnError::from)) {
+                Ok(data) => {
+                    if let Err(e) = write_atomic(&self.file_path(file_id), &data) {
+                        error.get_or_insert(e);
                     }
-                });
-            }
-            drop(tx);
-            let mut missing = 0;
-            for fetched in rx {
-                let result = match fetched {
-                    Fetched::Bytes(bytes) => {
-                        progress(bytes);
-                        continue;
-                    }
-                    Fetched::Done(result) => result,
-                };
-                match result {
-                    Ok((base_id, file_id, data)) => {
-                        write_atomic(&self.file_path(file_id), &data)?;
-                        models.insert(base_id, data);
-                    }
-                    Err((FileConnError::NotFound(id), _)) => {
-                        missing += 1;
-                        progress(Progress::MissingFile(id));
-                    }
-                    Err((_, file_id)) if best_effort && file_id != 0 => {
-                        missing += 1;
-                        progress(Progress::MissingFile(file_id));
-                    }
-                    Err((e, _)) => {
-                        // Stop the other workers.
-                        queue.lock().expect("queue").clear();
-                        return Err(e.into());
+                    for base_id in base_ids {
+                        models.insert(base_id, data.clone());
                     }
                 }
-                progress(step(models.len() + missing, total));
+                Err(FileConnError::NotFound(_)) => {
+                    missing += 1;
+                    progress(Progress::MissingFile(file_id));
+                }
+                Err(_) if best_effort => {
+                    missing += 1;
+                    progress(Progress::MissingFile(file_id));
+                }
+                Err(e) => {
+                    error.get_or_insert(e.into());
+                }
             }
-            Ok(())
-        })
+            progress(step(models.len() + missing, total));
+        });
+        drop(client);
+        if let Some(e) = error {
+            return Err(e);
+        }
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) if !best_effort => Err(e.into()),
+            Err(_) => {
+                for &file_id in pending.keys() {
+                    missing += 1;
+                    progress(Progress::MissingFile(file_id));
+                }
+                progress(step(models.len() + missing, total));
+                Ok(())
+            }
+        }
     }
 
     /// A map file by exact file id (as in [`PathingData::file_id`]), from

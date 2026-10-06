@@ -1,6 +1,6 @@
 pub mod api;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod fileconn;
+pub use gw_fileconn as fileconn;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mapdb;
 pub mod mapfile;
