@@ -4,7 +4,7 @@
 //! texture list.
 //!
 //! Only what a top-down render needs is decoded: each submesh's triangles,
-//! positions, UV sets and base texture. Layout from the client
+//! positions, UV sets, base texture and alpha texOp. Layout from the client
 //! (`MdlDecomp_ConvertSubmesh @79a3e0`) and GuildWarsMapBrowser
 //! (`FFNA_ModelFile_Other.h`, `FFNA_ModelFile.h`).
 
@@ -28,6 +28,10 @@ mod class {
 pub struct TextureSlot {
     pub texture: u8,
     pub uv_set: u8,
+    /// The texOp of the shader's first layer, which decides whether the
+    /// client blends with alpha (`Material_GetBlendMode @790830`); `None`
+    /// where the format doesn't say.
+    pub blend: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,7 +79,7 @@ pub fn texture_refs(chunk: &[u8]) -> Result<Vec<u32>, MapFileError> {
 /// How submeshes pick their base texture.
 enum Materials {
     /// Prophecies/Factions: per shader, a run of texture slots.
-    Old { slots_per_shader: Vec<u8>, uv_sets: Vec<u8>, textures: Vec<u8> },
+    Old { slots_per_shader: Vec<u8>, uv_sets: Vec<u8>, blends: Vec<u8>, textures: Vec<u8> },
     /// Nightfall/EotN: per texture group, a run of texture slots.
     Modern { slots_per_group: Vec<u8>, textures: Vec<u8> },
     None,
@@ -84,19 +88,20 @@ enum Materials {
 impl Materials {
     fn slot(&self, material: u32, texture_count: usize) -> Option<TextureSlot> {
         match self {
-            Materials::Old { slots_per_shader, uv_sets, textures } => {
+            Materials::Old { slots_per_shader, uv_sets, blends, textures } => {
                 let shader = material as usize % slots_per_shader.len().max(1);
                 let start: usize = slots_per_shader.iter().take(shader).map(|&n| n as usize).sum();
                 let count = *slots_per_shader.get(shader)? as usize;
-                // The first slot that maps a texture: 255 skips the slot, 253
-                // takes the UV set of the next one.
-                (start..start + count).find_map(|i| {
-                    let uv = match *uv_sets.get(i)? {
-                        255 => return None,
-                        253 => *uv_sets.get(i + 1).filter(|&&u| u < 8)?,
-                        u => u,
-                    };
-                    Some(TextureSlot { texture: *textures.get(i)?, uv_set: uv })
+                let slots = start..(start + count).min(uv_sets.len());
+                // UV set 255 skips the slot. 253 is a reflection map (texcoords
+                // generated from the view-space reflection vector), never the
+                // diffuse; the client draws the layers after it over it.
+                let first = slots.clone().find(|&i| uv_sets[i] != 255)?;
+                let base = slots.clone().find(|&i| uv_sets[i] != 255 && uv_sets[i] != 253)?;
+                Some(TextureSlot {
+                    texture: *textures.get(base)?,
+                    uv_set: uv_sets[base],
+                    blend: blends.get(first).copied(),
                 })
             }
             Materials::Modern { slots_per_group, textures } => {
@@ -106,9 +111,9 @@ impl Materials {
                 if t as usize >= texture_count {
                     t &= 0x0F;
                 }
-                Some(TextureSlot { texture: t, uv_set: 0 })
+                Some(TextureSlot { texture: t, uv_set: 0, blend: None })
             }
-            Materials::None => (texture_count > 0).then_some(TextureSlot { texture: 0, uv_set: 0 }),
+            Materials::None => (texture_count > 0).then_some(TextureSlot { texture: 0, uv_set: 0, blend: None }),
         }
     }
 }
@@ -135,13 +140,14 @@ fn geometry(chunk: &[u8], texture_count: usize) -> Result<Option<Vec<Submesh>>, 
         r.bytes(n * 28)?;
     }
     let shaders = r.bytes(shader_count * 8)?;
-    // Slot arrays: u16 flags, u8 UV set, 4 zero bytes, u8 blend, u8 texture,
+    // Slot arrays: u16 flags, u8 UV set, 4 zero bytes, u8 texOp, u8 texture,
     // and one more byte per slot with weight sets.
     let slots = r.bytes(slot_count * 9 + if weight_sets != 0 { slot_count } else { 0 })?;
     let mut materials = if shader_count > 0 && slot_count > 0 {
         Materials::Old {
             slots_per_shader: shaders.chunks_exact(8).map(|s| s[7]).collect(),
             uv_sets: slots[2 * slot_count..3 * slot_count].to_vec(),
+            blends: slots[7 * slot_count..8 * slot_count].to_vec(),
             textures: slots[8 * slot_count..9 * slot_count].to_vec(),
         }
     } else {
@@ -240,6 +246,30 @@ fn read_uvs(r: &mut Reader, vertices: usize, sets: usize) -> Result<Vec<Vec<[f32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn old(slots_per_shader: &[u8], uv_sets: &[u8], blends: &[u8], textures: &[u8]) -> Materials {
+        Materials::Old {
+            slots_per_shader: slots_per_shader.to_vec(),
+            uv_sets: uv_sets.to_vec(),
+            blends: blends.to_vec(),
+            textures: textures.to_vec(),
+        }
+    }
+
+    /// Model 166763's roof shader: a reflection map (UV set 253) first, then
+    /// the roof tiles. The tiles are the base; the alpha op is the first
+    /// layer's.
+    #[test]
+    fn base_slot_skips_reflection_maps() {
+        let m = old(&[2, 4], &[0, 1, 253, 0, 1, 2], &[0, 6, 0, 3, 6, 6], &[0, 1, 8, 9, 6, 10]);
+        assert_eq!(m.slot(1, 20), Some(TextureSlot { texture: 9, uv_set: 0, blend: Some(0) }));
+        assert_eq!(m.slot(0, 20), Some(TextureSlot { texture: 0, uv_set: 0, blend: Some(0) }));
+        // Only a reflection map: nothing to draw from above.
+        assert_eq!(old(&[1], &[253], &[0], &[3]).slot(0, 4), None);
+        // Skipped slots don't count as the first layer.
+        let foliage = old(&[2], &[255, 0], &[0, 8], &[1, 2]);
+        assert_eq!(foliage.slot(0, 4), Some(TextureSlot { texture: 2, uv_set: 0, blend: Some(8) }));
+    }
 
     /// The reference models (`testdata/models`, from `fetch-models`) parse,
     /// and their texture slots point into their texture lists.

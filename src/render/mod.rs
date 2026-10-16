@@ -19,7 +19,7 @@ pub use bake::{PropEntry, SpriteImage, WorldRender, bake, bake_with, required_fi
 
 /// Version of the baked render. Bumped whenever rendering changes, which
 /// re-renders cached images (pathing data is versioned separately).
-pub const RENDER_VERSION: u32 = 2;
+pub const RENDER_VERSION: u32 = 3;
 
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum RenderError {

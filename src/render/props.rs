@@ -13,6 +13,29 @@ use super::terrain::{Mipmapped, shade};
 
 /// Alpha below which a texel is cut out (foliage, fences).
 const ALPHA_CUTOFF: f32 = 0.5;
+
+/// How a submesh uses its texture's alpha.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Alpha {
+    /// Alpha is a gloss or detail mask: ignored.
+    Opaque,
+    /// Texels below [`ALPHA_CUTOFF`] are cut out.
+    Cutout,
+}
+
+/// The alpha mode of a submesh, from its shader's first texOp; `None` skips
+/// the submesh. The client blends with alpha when that op is 1, 2, 7 or 8
+/// (`Material_GetBlendMode @790830`). 1 and 2 are glows, fire and flares,
+/// which from above would only be squares. 4 is opaque in the client, but
+/// its textures are hard masks (ropes, cloth, decals). Models whose format
+/// doesn't say keep the cut-out.
+fn alpha_mode(blend: Option<u8>) -> Option<Alpha> {
+    match blend {
+        Some(1 | 2) => None,
+        Some(4 | 7 | 8) | None => Some(Alpha::Cutout),
+        Some(_) => Some(Alpha::Opaque),
+    }
+}
 /// Colour of untextured surfaces (linear RGB).
 const UNTEXTURED: [f32; 3] = [0.55, 0.55, 0.52];
 
@@ -140,6 +163,7 @@ fn sprite(canvas: &Canvas, prop: usize, inst: &Instance, textures: &HashMap<u32,
         elevations: (0..h).flat_map(|y| (0..w).map(move |x| canvas.elevation[canvas_index(x, y)])).collect(),
     };
     for sub in &inst.model.submeshes {
+        let Some(alpha) = alpha_mode(sub.texture.and_then(|slot| slot.blend)) else { continue };
         let texture = sub.texture.and_then(|slot| {
             let id = inst.model.textures.get(slot.texture as usize)?;
             Some((textures.get(id)?, sub.uvs.get(slot.uv_set as usize).or(sub.uvs.first())?))
@@ -148,7 +172,7 @@ fn sprite(canvas: &Canvas, prop: usize, inst: &Instance, textures: &HashMap<u32,
         for tri in sub.indices.chunks_exact(3) {
             let [a, b, c] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
             let uv = texture.map(|(_, uvs)| [uvs[a], uvs[b], uvs[c]]);
-            target.triangle([world[a], world[b], world[c]], texture.map(|(t, _)| t), uv);
+            target.triangle([world[a], world[b], world[c]], texture.map(|(t, _)| t), uv, alpha);
         }
     }
 
@@ -190,7 +214,7 @@ struct Target {
 }
 
 impl Target {
-    fn triangle(&mut self, world: [[f32; 3]; 3], texture: Option<&Mipmapped>, uv: Option<[[f32; 2]; 3]>) {
+    fn triangle(&mut self, world: [[f32; 3]; 3], texture: Option<&Mipmapped>, uv: Option<[[f32; 2]; 3]>, alpha: Alpha) {
         let p = world.map(|w| self.view.pixel([w[0], w[1]]));
         let area = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (p[1][1] - p[0][1]);
         if area.abs() < 1e-9 {
@@ -250,7 +274,7 @@ impl Target {
                         let u = w0 * uv[0][0] + w1 * uv[1][0] + w2 * uv[2][0];
                         let v = w0 * uv[0][1] + w1 * uv[1][1] + w2 * uv[2][1];
                         let s = tex.sample_wrapped(u * tex.width as f32, v * tex.height as f32);
-                        if s[3] / 255.0 < ALPHA_CUTOFF {
+                        if alpha == Alpha::Cutout && s[3] / 255.0 < ALPHA_CUTOFF {
                             continue;
                         }
                         [s[0] / 255.0, s[1] / 255.0, s[2] / 255.0]
@@ -275,7 +299,8 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::model::Submesh;
+    use crate::render::atex::Texture;
+    use crate::render::model::{Submesh, TextureSlot};
 
     /// A flat untextured square of side `2 * half` at elevation `z` (up),
     /// tilted so its elevation rises by `tilt` per unit of x.
@@ -290,6 +315,40 @@ mod tests {
                 texture: None,
             }],
             textures: Vec::new(),
+        }
+    }
+
+    /// A flat square textured with one fully transparent red texel, whose
+    /// shader's first texOp is `blend`.
+    fn transparent_square(blend: Option<u8>) -> Model {
+        let mut model = square(16.0, 10.0, 0.0);
+        let sub = &mut model.submeshes[0];
+        sub.uvs = vec![vec![[0.5, 0.5]; 4]];
+        sub.texture = Some(TextureSlot { texture: 0, uv_set: 0, blend });
+        model.textures = vec![77];
+        model
+    }
+
+    /// The texture's alpha cuts out only alpha-blended layers; glow layers
+    /// aren't drawn at all.
+    #[test]
+    fn alpha_follows_the_first_texop() {
+        let view = View::fit([0.0, 0.0, 64.0, 64.0], 1.0, 1024);
+        let mut canvas = Canvas::new(view);
+        canvas.elevation.iter_mut().for_each(|e| *e = 0.0);
+        let texel = Texture { width: 1, height: 1, pixels: vec![[255, 0, 0, 0]] };
+        let textures = HashMap::from([(77, Mipmapped::new(texel))]);
+        let drawn = |blend| {
+            let models = HashMap::from([(10, transparent_square(blend))]);
+            let sprites = rasterize(&canvas, &[prop(0, 32.0, 32.0)], &[10], &models, &textures);
+            sprites.first().map(|s| s.color[s.color.len() / 2])
+        };
+        for blend in [Some(0), Some(3)] {
+            let c = drawn(blend).expect("opaque layer drawn");
+            assert!(c[0] > 0.0 && c[1] == 0.0, "{blend:?}: {c:?}");
+        }
+        for blend in [Some(8), None, Some(1)] {
+            assert_eq!(drawn(blend), None, "{blend:?}");
         }
     }
 

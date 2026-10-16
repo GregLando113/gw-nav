@@ -66,7 +66,7 @@ The single-image format (v1) was about 5 MB and 1 s for Jaga Moraine. The all-pr
 | `render::terrain` | Texture splatting, as planned (Phase 3). Texture index = terrain file-ref index (GWMB ignores tag 4). Mip level from texels per pixel. Hill-shading from normals with a fixed light from the north-west. Water is tinted over terrain below the surface. |
 | `mapfile::environment` | Lighting (section 3) and water (section 6) records. The tail after section 7 doesn't match GWMB's "section 8", so the first record is used. |
 | `render::model` | `0xBB8` geometry, see below. 270 of 272 reference models parse; the two with morph targets are skipped. |
-| `render::props` | Props placed with the collision transform (yaw and scale; `pathgen::props`, without the rounding), rasterized one sprite per prop, in parallel across props. Depth-tested against the terrain elevation, flat-shaded, mip-sampled, texels with alpha below 0.5 cut out. |
+| `render::props` | Props placed with the collision transform (yaw and scale; `pathgen::props`, without the rounding), rasterized one sprite per prop, in parallel across props. Depth-tested against the terrain elevation, flat-shaded, mip-sampled. Texels with alpha below 0.5 are cut out where the shader's first texOp blends with alpha; glow layers are skipped (see below). |
 
 ### `0xBB8` model findings
 Fileserver models are all in the "other" format (`0xBB8`…`0xBC0` chunks). GWMB's parse of it drifts after the first submesh.
@@ -79,14 +79,18 @@ Fileserver models are all in the "other" format (`0xBB8`…`0xBC0` chunks). GWMB
   - the UV section: `u16 runs_u, u16 runs_v`, `(runs_u + runs_v) × 4` bytes of run lengths and offsets, then `nv × sets × 4` bytes of `u16` fractions
   - `groups × 3 + bones + triangle_groups × 12` bytes
 - **UVs:** a coordinate is `fraction / 65535 + offset[run]`. The runs continue across UV sets (`MdlDecomp_ConvertSubmesh @79a3e0`).
-- **Base texture, Prophecies/Factions:** the material index picks a shader. A shader's last header byte is its slot count. The slot arrays are struct-of-arrays: `u16` flags, `u8` UV set (255 skips the slot, 253 takes the next slot's set), 4 zero bytes, `u8` blend, `u8` texture.
+- **Base texture, Prophecies/Factions:** the material index picks a shader. A shader's last header byte is its slot count. The slot arrays are struct-of-arrays: `u16` flags, `u8` UV set, 4 zero bytes, `u8` texOp, `u8` texture. The base texture is the first slot whose UV set is neither 255 (skipped) nor 253.
+- **UV set 253 is a reflection map.** The client copies the slot arrays into `0xFA0` unchanged, so 253 reaches the renderer as texcoord −3. `Dx9ShaderStage_BuildTextureStateList @6db770` maps −3 to a coordinate generated from the view-space reflection vector (`Dx9ShaderGen_EmitTexCoordOutputs @6e7140`, `Dx9ShaderGen_EmitReflection`). The textures in these slots are bubbles, light blobs and sheen gradients; drawn as the diffuse they gave roofs and rocks a grey bubble pattern. 2,270 of 19,990 shaders in the cached models start with one.
+- **The texOp byte** is the layer's combine op (`Gr_Material_CreateLayered @6644b0`: `texOp[layer] < GR_TEXOP_FIRST_EFFECT`). 0 loads (the stack restarts at the last texOp-0 layer); the others map to D3D ops, e.g. 3 ADD, 7 BLENDTEXTUREALPHA, 13 MODULATE, 14 MODULATE2X.
+- **Alpha:** the client blends with alpha when the shader's *first* texOp is 1, 2, 7 or 8 (`Material_GetBlendMode @790830`); otherwise a diffuse's alpha is a gloss or detail mask, often below 0.5 (rocks, roofs, docks). The render cuts out for first texOps 7 and 8, and for 4, whose textures are hard masks (ropes, cloth, decals) though the client draws it opaque. It skips 1 and 2 (glows, fire, flares) and draws the rest opaque. Nightfall/EotN models have no texOp without their AMAT files and keep the cut-out.
 - **Base texture, Nightfall/EotN** (`texture_groups > 0`): the material index picks a 9-byte group; byte 6 is its slot count. The table after the groups is `slots × u16` flags, then `slots × u8` texture indices.
 - **Textures:** `0xBBB` holds `u32`, `u32 count`, then 6-byte file references.
 
 ### Still open
 - Zone foliage (deferred, as scoped).
 - The environment's active record selection.
-- Textures beyond each submesh's base texture (detail and specular layers are ignored).
+- Textures beyond each submesh's base texture: reflection maps, and detail and lightmap layers combined by texOp.
+- Nightfall/EotN alpha and slot order, which come from AMAT material files that aren't fetched.
 - Full prop tilt (only yaw is applied).
 - The web build compiles and bundles, but hasn't been run in a browser.
 
